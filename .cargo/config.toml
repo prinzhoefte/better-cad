@@ -1,0 +1,10 @@
+# Build settings that make this project build on this computer (NixOS):
+# - rustc: the installed rustup toolchain, started through tools/rustc so it also runs on NixOS
+# - linker: tools/cc finds a C compiler even when none is on PATH
+# - the bundled rust-lld wrapper breaks on folder names with spaces, so the system linker is used
+[build]
+rustc = "tools/rustc"
+
+[target.x86_64-unknown-linux-gnu]
+linker = "tools/cc"
+rustflags = ["-C", "link-arg=-fuse-ld=bfd"]
