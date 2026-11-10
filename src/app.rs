@@ -1095,11 +1095,8 @@ impl App {
                 _ => vec![],
             };
             let mut segs: Vec<(usize, Color)> = Vec::new();
-            for r in &refs {
-                if let Some(i) = find_edge(&sharp, r) {
-                    segs.extend(edge_chain(&sharp, i).into_iter().map(|k| (k, C_SEL)));
-                }
-            }
+            let picked: Vec<usize> = refs.iter().filter_map(|r| find_edge(&sharp, r)).collect();
+            segs.extend(edge_chains(&sharp, &picked).into_iter().map(|k| (k, C_SEL)));
             if let Some(h) = self.hover_edge {
                 segs.extend(edge_chain(&sharp, h).into_iter().map(|k| (k, Color::new(0.45, 0.85, 1.0, 1.0))));
             }

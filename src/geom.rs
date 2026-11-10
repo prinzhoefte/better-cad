@@ -70,65 +70,51 @@ pub struct Solid {
     pub polys: Vec<Poly>,
 }
 
+/// A piece of an input polygon on its way through the BSP trees, with the number of the
+/// polygon it was cut from.
+type Frag = (Poly, u32);
+
 const COPLANAR: u8 = 0;
 const FRONT: u8 = 1;
 const BACK: u8 = 2;
-const SPANNING: u8 = 3;
 const SPLIT_EPS: f64 = 1e-5;
 
-fn split_polygon(
-    plane: &Plane,
-    poly: &Poly,
-    cf: &mut Vec<Poly>,
-    cb: &mut Vec<Poly>,
-    f: &mut Vec<Poly>,
-    b: &mut Vec<Poly>,
-) {
-    let mut ptype = 0u8;
-    let mut types = Vec::with_capacity(poly.v.len());
-    for p in &poly.v {
-        let t = plane.n.dot(*p) - plane.w;
-        let ty = if t < -SPLIT_EPS { BACK } else if t > SPLIT_EPS { FRONT } else { COPLANAR };
-        ptype |= ty;
-        types.push(ty);
-    }
-    match ptype {
-        COPLANAR => {
-            if plane.n.dot(poly.plane.n) > 0.0 {
-                cf.push(poly.clone())
-            } else {
-                cb.push(poly.clone())
-            }
-        }
-        FRONT => f.push(poly.clone()),
-        BACK => b.push(poly.clone()),
+/// Splits a polygon by a plane: (it lies in the plane, front part, back part). A polygon in
+/// the plane counts as front when it faces the plane's way, as back otherwise.
+fn split_polygon(plane: &Plane, (poly, src): Frag) -> (bool, Option<Frag>, Option<Frag>) {
+    let side = |p: DVec3| {
+        let t = plane.n.dot(p) - plane.w;
+        if t < -SPLIT_EPS { BACK } else if t > SPLIT_EPS { FRONT } else { COPLANAR }
+    };
+    match poly.v.iter().fold(COPLANAR, |s, p| s | side(*p)) {
+        COPLANAR if plane.n.dot(poly.plane.n) > 0.0 => (true, Some((poly, src)), None),
+        COPLANAR => (true, None, Some((poly, src))),
+        FRONT => (false, Some((poly, src)), None),
+        BACK => (false, None, Some((poly, src))),
         _ => {
-            let mut fv = Vec::new();
-            let mut bv = Vec::new();
+            let mut fv = Vec::with_capacity(poly.v.len() + 1);
+            let mut bv = Vec::with_capacity(poly.v.len() + 1);
             let n = poly.v.len();
             for i in 0..n {
-                let j = (i + 1) % n;
-                let (ti, tj) = (types[i], types[j]);
-                let (vi, vj) = (poly.v[i], poly.v[j]);
+                let (vi, vj) = (poly.v[i], poly.v[(i + 1) % n]);
+                let (ti, tj) = (side(vi), side(vj));
                 if ti != BACK {
                     fv.push(vi);
                 }
                 if ti != FRONT {
                     bv.push(vi);
                 }
-                if (ti | tj) == SPANNING {
-                    let t = (plane.w - plane.n.dot(vi)) / plane.n.dot(vj - vi);
-                    let v = vi.lerp(vj, t);
+                if (ti | tj) == FRONT | BACK {
+                    // from the same end whichever way round the polygon runs, so the polygon
+                    // on the other side of this edge is cut at exactly the same point
+                    let (p, q) = if vi.to_array() < vj.to_array() { (vi, vj) } else { (vj, vi) };
+                    let v = p.lerp(q, (plane.w - plane.n.dot(p)) / plane.n.dot(q - p));
                     fv.push(v);
                     bv.push(v);
                 }
             }
-            if fv.len() >= 3 {
-                f.push(Poly { v: fv, plane: poly.plane });
-            }
-            if bv.len() >= 3 {
-                b.push(Poly { v: bv, plane: poly.plane });
-            }
+            let part = |v: Vec<DVec3>| (v.len() >= 3).then(|| (Poly { v, plane: poly.plane }, src));
+            (false, part(fv), part(bv))
         }
     }
 }
@@ -138,18 +124,18 @@ struct Node {
     plane: Option<Plane>,
     front: Option<Box<Node>>,
     back: Option<Box<Node>>,
-    polys: Vec<Poly>,
+    polys: Vec<Frag>,
 }
 
 impl Node {
-    fn new(polys: Vec<Poly>) -> Node {
+    fn new(polys: Vec<Frag>) -> Node {
         let mut n = Node::default();
         n.build(polys);
         n
     }
     fn invert(&mut self) {
         for p in &mut self.polys {
-            p.flip();
+            p.0.flip();
         }
         if let Some(pl) = &mut self.plane {
             pl.flip();
@@ -162,68 +148,60 @@ impl Node {
         }
         std::mem::swap(&mut self.front, &mut self.back);
     }
-    fn clip_polygons(&self, polys: Vec<Poly>) -> Vec<Poly> {
-        let plane = match &self.plane {
-            Some(p) => p,
-            None => return polys,
-        };
-        let mut f = Vec::new();
-        let mut b = Vec::new();
-        for p in &polys {
-            let mut cf = Vec::new();
-            let mut cb = Vec::new();
-            split_polygon(plane, p, &mut cf, &mut cb, &mut f, &mut b);
-            f.extend(cf);
-            b.extend(cb);
+    /// Removes the parts of the polygons inside this tree's solid, noting in `gone` which
+    /// polygons lost something.
+    fn clip_polygons(&self, polys: Vec<Frag>, gone: &mut [bool]) -> Vec<Frag> {
+        let Some(plane) = &self.plane else { return polys };
+        let (mut f, mut b) = (Vec::new(), Vec::new());
+        for p in polys {
+            let (_, pf, pb) = split_polygon(plane, p);
+            f.extend(pf);
+            b.extend(pb);
         }
         let mut f = match &self.front {
-            Some(n) => n.clip_polygons(f),
+            Some(n) => n.clip_polygons(f, gone),
             None => f,
         };
-        let b = match &self.back {
-            Some(n) => n.clip_polygons(b),
-            None => Vec::new(),
-        };
-        f.extend(b);
+        match &self.back {
+            Some(n) => f.extend(n.clip_polygons(b, gone)),
+            None => b.iter().for_each(|p| gone[p.1 as usize] = true),
+        }
         f
     }
-    fn clip_to(&mut self, bsp: &Node) {
-        self.polys = bsp.clip_polygons(std::mem::take(&mut self.polys));
+    fn clip_to(&mut self, bsp: &Node, gone: &mut [bool]) {
+        self.polys = bsp.clip_polygons(std::mem::take(&mut self.polys), gone);
         if let Some(f) = &mut self.front {
-            f.clip_to(bsp);
+            f.clip_to(bsp, gone);
         }
         if let Some(b) = &mut self.back {
-            b.clip_to(bsp);
+            b.clip_to(bsp, gone);
         }
     }
-    fn all_polygons(&self) -> Vec<Poly> {
-        let mut out = self.polys.clone();
-        if let Some(f) = &self.front {
-            out.extend(f.all_polygons());
+    fn collect(self, out: &mut Vec<Frag>) {
+        out.extend(self.polys);
+        if let Some(f) = self.front {
+            f.collect(out);
         }
-        if let Some(b) = &self.back {
-            out.extend(b.all_polygons());
+        if let Some(b) = self.back {
+            b.collect(out);
         }
-        out
     }
-    fn build(&mut self, polys: Vec<Poly>) {
+    fn build(&mut self, polys: Vec<Frag>) {
         if polys.is_empty() {
             return;
         }
-        if self.plane.is_none() {
-            // pick a splitter near the middle of the list (better balance than the first)
-            self.plane = Some(polys[polys.len() / 2].plane);
+        // pick a splitter near the middle of the list (better balance than the first)
+        let plane = *self.plane.get_or_insert(polys[polys.len() / 2].0.plane);
+        let (mut f, mut b) = (Vec::new(), Vec::new());
+        for p in polys {
+            match split_polygon(&plane, p) {
+                (true, pf, pb) => self.polys.extend(pf.or(pb)),
+                (false, pf, pb) => {
+                    f.extend(pf);
+                    b.extend(pb);
+                }
+            }
         }
-        let plane = self.plane.unwrap();
-        let mut f = Vec::new();
-        let mut b = Vec::new();
-        let mut cf = Vec::new();
-        let mut cb = Vec::new();
-        for p in &polys {
-            split_polygon(&plane, p, &mut cf, &mut cb, &mut f, &mut b);
-        }
-        self.polys.extend(cf);
-        self.polys.extend(cb);
         if !f.is_empty() {
             self.front.get_or_insert_with(Default::default).build(f);
         }
@@ -231,6 +209,206 @@ impl Node {
             self.back.get_or_insert_with(Default::default).build(b);
         }
     }
+}
+
+/// The part of a polygon inside a box (None when it is outside altogether), and the pieces
+/// of it sticking out.
+fn clip_to_box(p: &Poly, src: u32, bb: &Aabb) -> (Option<Frag>, Vec<Frag>) {
+    let mut pb = Aabb::empty();
+    p.v.iter().for_each(|v| pb.add(*v));
+    if !pb.overlaps(bb) {
+        return (None, Vec::new());
+    }
+    let mut cur = Some((p.clone(), src));
+    let mut out = Vec::new();
+    if pb.min.cmpge(bb.min).all() && pb.max.cmple(bb.max).all() {
+        return (cur, out);
+    }
+    for axis in 0..3 {
+        for (sign, w) in [(1.0, bb.max[axis]), (-1.0, -bb.min[axis])] {
+            let Some(c) = cur.take() else { return (None, out) };
+            let mut n = DVec3::ZERO;
+            n[axis] = sign;
+            match split_polygon(&Plane { n, w }, c) {
+                (true, f, b) => cur = f.or(b),
+                (false, f, b) => {
+                    out.extend(f);
+                    cur = b;
+                }
+            }
+        }
+    }
+    (cur, out)
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Op {
+    Union,
+    Subtract,
+    Intersect,
+}
+
+/// Combines two solids with BSP trees. Two things keep this fast and the result tidy on a
+/// body that already has many faces:
+/// - only the polygons where the two bounding boxes overlap go into the trees: nothing
+///   outside that box can be cut, and inside it the trees of the local polygons tell inside
+///   from outside just as the full ones would;
+/// - a polygon that comes through with nothing removed is put back whole, not as the
+///   pieces the trees cut it into.
+fn boolean(a: &Solid, b: &Solid, op: Op) -> Solid {
+    let (ba, bb) = (a.bbox(), b.bbox());
+    let (lo, hi) = (ba.min.max(bb.min), ba.max.min(bb.max));
+    // some room around it, so its sides do not graze the faces being cut
+    let grow = DVec3::splat(0.01 + 0.02 * (hi - lo).max_element());
+    let region = Aabb { min: lo - grow, max: hi + grow };
+    let na = a.polys.len();
+    let original = |src: usize| if src < na { &a.polys[src] } else { &b.polys[src - na] };
+    // what lies outside the other solid's box is outside that solid
+    let keep_outside = [op != Op::Intersect, op == Op::Union];
+    let mut gone = vec![false; na + b.polys.len()];
+    let mut out = Vec::new();
+    let mut frags: Vec<Frag> = Vec::new();
+    let mut local = [Vec::new(), Vec::new()];
+    for (k, s) in [a, b].into_iter().enumerate() {
+        for (i, p) in s.polys.iter().enumerate() {
+            let src = k * na + i;
+            match clip_to_box(p, src as u32, &region) {
+                (None, _) if keep_outside[k] => out.push(p.clone()),
+                (None, _) => {}
+                (Some(inside), outside) => {
+                    local[k].push(inside);
+                    if keep_outside[k] {
+                        frags.extend(outside);
+                    } else if !outside.is_empty() {
+                        gone[src] = true;
+                    }
+                }
+            }
+        }
+    }
+    // no skin of a solid in the box: the box is all inside that solid or all outside it. A
+    // tree with nothing in it cannot say which, so a block stands in for the solid: around
+    // the box, or beside it (its own faces are thrown away again)
+    let stand_in = gone.len() as u32;
+    gone.push(false);
+    for (k, s) in [a, b].into_iter().enumerate() {
+        if local[k].is_empty() {
+            let block = if s.contains(region.center()) { box_solid(region.min - grow, region.max + grow) } else { box_solid(region.max + grow, region.max + grow * 2.0) };
+            local[k] = block.polys.into_iter().map(|p| (p, stand_in)).collect();
+        }
+    }
+    let [la, lb] = local;
+    let (mut ta, mut tb) = (Node::new(la), Node::new(lb));
+    let g = &mut gone[..];
+    match op {
+        Op::Union => {
+            ta.clip_to(&tb, g);
+            tb.clip_to(&ta, g);
+            tb.invert();
+            tb.clip_to(&ta, g);
+            tb.invert();
+        }
+        Op::Subtract => {
+            ta.invert();
+            ta.clip_to(&tb, g);
+            tb.clip_to(&ta, g);
+            tb.invert();
+            tb.clip_to(&ta, g);
+            tb.invert();
+            ta.invert();
+        }
+        Op::Intersect => {
+            ta.invert();
+            tb.clip_to(&ta, g);
+            tb.invert();
+            ta.clip_to(&tb, g);
+            tb.clip_to(&ta, g);
+            ta.invert();
+            tb.invert();
+        }
+    }
+    ta.collect(&mut frags);
+    tb.collect(&mut frags);
+    // the pieces left of each polygon that lost something, in the order they came out
+    let mut pieces: Vec<Vec<Poly>> = vec![Vec::new(); gone.len()];
+    let mut order = Vec::new();
+    for (p, src) in frags.into_iter().filter(|f| f.1 != stand_in) {
+        let s = src as usize;
+        if pieces[s].is_empty() {
+            order.push(s);
+        }
+        if gone[s] || pieces[s].is_empty() {
+            pieces[s].push(p);
+        }
+    }
+    for s in order {
+        let left = std::mem::take(&mut pieces[s]);
+        let left = if gone[s] { merge_pieces(left) } else { vec![original(s).clone()] };
+        // what is left of a removed solid's skin bounds the result from the inside
+        let flip = op == Op::Subtract && s >= na;
+        out.extend(left.into_iter().map(|mut p| {
+            if flip {
+                p.flip();
+            }
+            p
+        }));
+    }
+    Solid { polys: out }
+}
+
+/// Joins the pieces a polygon was cut into back together, wherever two of them share an
+/// edge and make one convex polygon again.
+fn merge_pieces(pieces: Vec<Poly>) -> Vec<Poly> {
+    let Some(plane) = pieces.first().map(|p| p.plane) else { return pieces };
+    // the very same point: both sides of a cut get the same new points (see split_polygon),
+    // and anything looser pairs up the wrong edges among slivers
+    type Key = [u64; 3];
+    let key = |p: DVec3| -> Key { p.to_array().map(|x| (x + 0.0).to_bits()) };
+    let mut polys: Vec<Vec<DVec3>> = pieces.into_iter().map(|p| p.v).collect();
+    // which piece runs along each edge, in its own direction
+    let mut edges: HashMap<(Key, Key), usize> = HashMap::new();
+    let sides = |v: &[DVec3]| -> Vec<(Key, Key)> { (0..v.len()).map(|k| (key(v[k]), key(v[(k + 1) % v.len()]))).collect() };
+    for (i, v) in polys.iter().enumerate() {
+        edges.extend(sides(v).into_iter().map(|e| (e, i)));
+    }
+    let mut work: Vec<usize> = (0..polys.len()).collect();
+    while let Some(i) = work.pop() {
+        let v = &polys[i];
+        let joined = sides(v).into_iter().enumerate().find_map(|(k, (a, b))| {
+            let j = *edges.get(&(b, a)).filter(|j| **j != i)?;
+            let w = &polys[j];
+            let kj = (0..w.len()).find(|&x| key(w[x]) == b && key(w[(x + 1) % w.len()]) == a)?;
+            // around v from the end of the shared edge to its start, then the rest of w
+            let mut m: Vec<DVec3> = (1..=v.len()).map(|x| v[(k + x) % v.len()]).collect();
+            m.extend((2..w.len()).map(|x| w[(kj + x) % w.len()]));
+            // the two ends of the shared edge: straight through (drop the point), a convex
+            // corner (keep it) or a dent (the pieces stay apart)
+            for at in [v.len() - 1, 0] {
+                let n = m.len();
+                let (e1, e2) = (m[at] - m[(at + n - 1) % n], m[(at + 1) % n] - m[at]);
+                let c = e1.cross(e2);
+                if c.length() <= 1e-9 * e1.length() * e2.length() {
+                    m.remove(at);
+                } else if c.dot(plane.n) < 0.0 {
+                    return None;
+                }
+            }
+            (m.len() >= 3).then_some((j, m))
+        });
+        if let Some((j, m)) = joined {
+            for (x, old) in [(i, std::mem::take(&mut polys[i])), (j, std::mem::take(&mut polys[j]))] {
+                for e in sides(&old) {
+                    if edges.get(&e) == Some(&x) {
+                        edges.remove(&e);
+                    }
+                }
+            }
+            edges.extend(sides(&m).into_iter().map(|e| (e, i)));
+            polys[i] = m;
+            work.push(i);
+        }
+    }
+    polys.into_iter().filter(|v| !v.is_empty()).map(|v| Poly { v, plane }).collect()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -307,47 +485,20 @@ impl Solid {
             p.extend(other.polys.iter().cloned());
             return Solid { polys: p };
         }
-        let mut a = Node::new(self.polys.clone());
-        let mut b = Node::new(other.polys.clone());
-        a.clip_to(&b);
-        b.clip_to(&a);
-        b.invert();
-        b.clip_to(&a);
-        b.invert();
-        a.build(b.all_polygons());
-        Solid { polys: a.all_polygons() }
+        boolean(self, other, Op::Union)
     }
     pub fn subtract(&self, other: &Solid) -> Solid {
         if self.is_empty() || other.is_empty() || !self.bbox().overlaps(&other.bbox()) {
             return self.clone();
         }
-        let mut a = Node::new(self.polys.clone());
-        let mut b = Node::new(other.polys.clone());
-        a.invert();
-        a.clip_to(&b);
-        b.clip_to(&a);
-        b.invert();
-        b.clip_to(&a);
-        b.invert();
-        a.build(b.all_polygons());
-        a.invert();
-        Solid { polys: a.all_polygons() }
+        boolean(self, other, Op::Subtract)
     }
     #[allow(dead_code)]
     pub fn intersect(&self, other: &Solid) -> Solid {
         if self.is_empty() || other.is_empty() || !self.bbox().overlaps(&other.bbox()) {
             return Solid::default();
         }
-        let mut a = Node::new(self.polys.clone());
-        let mut b = Node::new(other.polys.clone());
-        a.invert();
-        b.clip_to(&a);
-        b.invert();
-        a.clip_to(&b);
-        b.clip_to(&a);
-        a.build(b.all_polygons());
-        a.invert();
-        Solid { polys: a.all_polygons() }
+        boolean(self, other, Op::Intersect)
     }
     pub fn transformed(&self, f: impl Fn(DVec3) -> DVec3, mirror: bool) -> Solid {
         let mut out = Vec::with_capacity(self.polys.len());
@@ -368,6 +519,15 @@ impl Solid {
     pub fn rotated(&self, origin: DVec3, axis: DVec3, angle: f64) -> Solid {
         let q = DQuat::from_axis_angle(axis.normalize(), angle);
         self.transformed(|p| origin + q * (p - origin), false)
+    }
+    /// Whether a point lies inside the solid: a ray from it leaves through the skin once more
+    /// than it enters.
+    // ponytail: one ray in a skew direction; one that runs exactly through an edge is
+    // counted wrong. Cast a second one if that ever shows
+    pub fn contains(&self, p: DVec3) -> bool {
+        let d = DVec3::new(0.3713, 0.5477, 0.7497);
+        let hits = |q: &Poly| (1..q.v.len() - 1).filter(|&i| ray_tri(p, d, &[q.v[0], q.v[i], q.v[i + 1]]).is_some()).count();
+        self.polys.iter().map(hits).sum::<usize>() % 2 == 1
     }
     /// Signed volume (positive for a correctly oriented closed solid), in mm³.
     pub fn volume(&self) -> f64 {
@@ -1155,8 +1315,18 @@ impl Mesh {
                 if steps > 4000 {
                     break;
                 }
-                for &k in &self.tris[t] {
-                    reach = reach.max((self.pos[k as usize] - a).dot(d).abs());
+                // only what lies beside the edge counts, not where the face runs on past its ends
+                let p = self.tri_pts(t).map(|q| q - a);
+                for k in 0..3 {
+                    let (q0, q1) = (p[k], p[(k + 1) % 3]);
+                    let (s0, s1) = (q0.dot(e), q1.dot(e));
+                    if s0.max(s1) < -tol || s0.min(s1) > len + tol {
+                        continue;
+                    }
+                    for s in [s0, s1] {
+                        let f = if (s1 - s0).abs() > 1e-12 { (s.clamp(0.0, len) - s0) / (s1 - s0) } else { 0.0 };
+                        reach = reach.max(q0.lerp(q1, f.clamp(0.0, 1.0)).dot(d).abs());
+                    }
                 }
                 for &u in &nbr[t] {
                     if seen.contains(&u) {
@@ -1541,6 +1711,29 @@ mod tests {
         let m = Mesh::from_solid(&c);
         assert!((m.volume() - 640.0).abs() < 1e-3);
     }
+    /// A boolean only works on the faces near its tool: the rest of a body with many faces
+    /// comes through untouched, and a tool with no face of the body near it (deep in the
+    /// material, or in the air of a hole) is still told apart.
+    #[test]
+    fn booleans_stay_local() {
+        let mut body = box_solid(DVec3::ZERO, DVec3::new(100.0, 100.0, 20.0));
+        for i in 0..4 {
+            body = body.subtract(&cylinder_solid(DVec3::new(10.0 + 10.0 * i as f64, 80.0, -1.0), DVec3::Z, 3.0, 22.0));
+        }
+        let v = body.volume();
+        // a notch in the far corner: the holes' faces are not cut up for it
+        let notch = body.subtract(&box_solid(DVec3::new(90.0, -1.0, 15.0), DVec3::new(101.0, 10.0, 21.0)));
+        assert!((v - notch.volume() - 500.0).abs() < 1e-6, "{}", v - notch.volume());
+        assert!(notch.polys.len() <= body.polys.len() + 12, "{} polygons from {}", notch.polys.len(), body.polys.len());
+        let block = box_solid(DVec3::new(40.0, 20.0, 5.0), DVec3::new(50.0, 30.0, 15.0));
+        assert!((v - body.subtract(&block).volume() - 1000.0).abs() < 1e-6, "a cavity inside the material");
+        assert!((body.union(&block).volume() - v).abs() < 1e-6, "material added inside the material");
+        let plug = box_solid(DVec3::new(9.0, 79.0, 5.0), DVec3::new(11.0, 81.0, 15.0));
+        assert!((body.subtract(&plug).volume() - v).abs() < 1e-6, "cutting in the air of a hole");
+        assert!((body.union(&plug).volume() - v - 40.0).abs() < 1e-6, "a plug in the air of a hole");
+        assert!((body.intersect(&plug).volume()).abs() < 1e-6 && (body.intersect(&block).volume() - 1000.0).abs() < 1e-6);
+    }
+
     #[test]
     fn revolve_cyl() {
         let prof = vec![DVec2::new(0.0, 0.0), DVec2::new(5.0, 0.0), DVec2::new(5.0, 10.0), DVec2::new(0.0, 10.0)];
