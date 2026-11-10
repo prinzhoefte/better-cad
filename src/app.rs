@@ -55,6 +55,8 @@ pub enum Dialog {
     Options,
     /// "Constraint Definition" of a sketch dimension
     Dim(usize),
+    /// colour and finish of a component (Some) or of the part being edited (None)
+    Appearance(Option<u32>),
 }
 
 #[derive(Clone)]
@@ -104,6 +106,8 @@ pub struct App {
     pub menu_open: Option<usize>,
     pub ctx_menu: Option<(Vec2, Sel)>,
     pub show_edges: bool,
+    /// realistic rendering with the parts' surface finishes (instead of technical shading)
+    pub realistic: bool,
     pub gizmo_drag: Option<GizmoDrag>,
     pub gizmo_hover: Option<Handle>,
     pub hover: Option<Hit>,
@@ -150,6 +154,7 @@ impl App {
             menu_open: None,
             ctx_menu: None,
             show_edges: true,
+            realistic: false,
             gizmo_drag: None,
             gizmo_hover: None,
             hover: None,
@@ -351,9 +356,10 @@ impl App {
 
         clear_background(WHITE);
         set_ui_camera();
-        draw_background();
+        draw_background(self.realistic);
         set_camera(&self.view.camera());
         self.rend.set_lights(&self.view);
+        self.rend.set_view_scale(&self.view);
         self.draw_scene();
         set_ui_camera();
         self.draw_overlays_2d();
@@ -379,14 +385,20 @@ impl App {
     fn draw_scene(&mut self) {
         let model_part = self.part_model();
         let sel_tint = vec4(1.0, 0.55, 0.1, 0.45);
-        let show_edges = self.show_edges;
+        // realistic rendering shows the finishes and no edge lines (like shading with material)
+        let real = self.realistic;
+        let show_edges = self.show_edges && !real;
         let view_ptr: *const View = &self.view;
         // Part document or part being edited
         match &mut self.doc {
             Doc::Part(p) => {
                 let m = p.mesh_live();
                 let col = p.color;
-                self.rend.draw(&m, col, &DMat4::IDENTITY, vec4(0.0, 0.0, 0.0, 0.0));
+                if real {
+                    self.rend.draw_real(&m, col, p.finish, &DMat4::IDENTITY, vec4(0.0, 0.0, 0.0, 0.0));
+                } else {
+                    self.rend.draw(&m, col, &DMat4::IDENTITY, vec4(0.0, 0.0, 0.0, 0.0));
+                }
                 if show_edges {
                     self.rend.draw_edges(&m, col, &DMat4::IDENTITY, unsafe { &*view_ptr }, Color::new(0.08, 0.08, 0.12, 1.0));
                 }
@@ -407,7 +419,11 @@ impl App {
                     } else {
                         vec4(0.0, 0.0, 0.0, 0.0)
                     };
-                    self.rend.draw(&m, c.part.color, &mx, tint);
+                    if real {
+                        self.rend.draw_real(&m, c.part.color, c.part.finish, &mx, tint);
+                    } else {
+                        self.rend.draw(&m, c.part.color, &mx, tint);
+                    }
                     if show_edges {
                         let ec = if active.is_some() && active != Some(c.id) { Color::new(0.5, 0.52, 0.56, 1.0) } else { Color::new(0.08, 0.08, 0.12, 1.0) };
                         self.rend.draw_edges(&m, c.part.color, &mx, unsafe { &*view_ptr }, ec);
@@ -1540,7 +1556,7 @@ impl App {
                             None => {
                                 if self.tool == Tool::None {
                                     self.sel = Sel::None;
-                                    if matches!(self.dialog, Dialog::Comp(_) | Dialog::Constraint(_)) {
+                                    if matches!(self.dialog, Dialog::Comp(_) | Dialog::Constraint(_) | Dialog::Appearance(Some(_))) {
                                         self.dialog = Dialog::None;
                                     }
                                 }
@@ -2082,7 +2098,7 @@ impl App {
             if self.menu_open.is_some() || self.ctx_menu.is_some() {
                 self.menu_open = None;
                 self.ctx_menu = None;
-            } else if matches!(self.dialog, Dialog::Help | Dialog::Options) {
+            } else if matches!(self.dialog, Dialog::Help | Dialog::Options | Dialog::Appearance(_)) {
                 self.dialog = Dialog::None;
             } else {
                 self.cancel();
@@ -2102,6 +2118,9 @@ impl App {
         }
         if inp.key(KeyCode::F) && self.sketch.is_none() {
             self.fit_all();
+        }
+        if inp.key(KeyCode::R) && self.sketch.is_none() && !inp.ctrl {
+            self.toggle_realistic();
         }
         if inp.key(KeyCode::F1) {
             self.dialog = Dialog::Help;

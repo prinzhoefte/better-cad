@@ -125,12 +125,14 @@ impl App {
                     it("Redo", "Ctrl+Y", !self.redo.is_empty());
                     it("Delete", "Del", (self.sel != Sel::None && !matches!(self.sel, Sel::Face { .. })) || sk_sel);
                     it("Properties", "", matches!(self.sel, Sel::Feature(_) | Sel::Comp(_) | Sel::Constraint(_)));
+                    it("Appearance...", "", self.part().is_some() || matches!(self.sel, Sel::Comp(_)));
                 }
                 3 => {
                     it("Fit All", "F", true);
                     it("Isometric", "", true);
                     it(if self.view.persp { "Parallel Projection" } else { "Perspective Projection" }, "", true);
                     it(if self.show_edges { "Hide Edges" } else { "Show Edges" }, "", true);
+                    it(if self.realistic { "Technical Shading" } else { "Realistic Rendering" }, "R", true);
                     it("-", "", true);
                     it("Bigger Interface", "Ctrl +", ui_scale() < 3.99);
                     it("Smaller Interface", "Ctrl -", ui_scale() > 0.76);
@@ -225,6 +227,8 @@ impl App {
             "Isometric" => self.set_view(vec3(1.0, 1.0, 0.8), Vec3::Z),
             "Parallel Projection" | "Perspective Projection" => self.view.persp = !self.view.persp,
             "Hide Edges" | "Show Edges" => self.show_edges = !self.show_edges,
+            "Realistic Rendering" | "Technical Shading" => self.toggle_realistic(),
+            "Appearance..." => self.open_appearance(),
             "Measure" => self.start_tool(Tool::Measure(None), "Measure: click the first point on a surface."),
             "Controls and Tips" => self.dialog = Dialog::Help,
             "Options..." => self.dialog = Dialog::Options,
@@ -368,6 +372,7 @@ impl App {
                     vec![
                         ("tb_import", "Import Mesh", "Bring an STL or OBJ file into this part"),
                         ("tb_measure", "Measure", "Distance between two points"),
+                        ("tb_appear", "Appearance", "Colour and surface finish of this part\n(plastic, 3D print, metal, wood: shown in realistic rendering)"),
                     ],
                 ),
             ];
@@ -399,7 +404,13 @@ impl App {
                     ("as_update", "Update All", "Re-apply all constraints"),
                 ],
             ),
-            ("Measure", vec![("as_measure", "Measure", "Distance between two points")]),
+            (
+                "Other",
+                vec![
+                    ("as_measure", "Measure", "Distance between two points"),
+                    ("as_appear", "Appearance", "Colour and surface finish of the selected component\n(plastic, 3D print, metal, wood: shown in realistic rendering)"),
+                ],
+            ),
         ]
     }
 
@@ -598,6 +609,7 @@ impl App {
             "tb_cpat" => self.add_pattern(true),
             "tb_import" => self.open_file_dialog(Purpose::ImportMesh),
             "tb_measure" | "as_measure" => self.start_tool(Tool::Measure(None), "Measure: click the first point on a surface."),
+            "tb_appear" | "as_appear" => self.open_appearance(),
             "tb_back" => self.back_to_assembly(),
             "as_newpart" => self.new_component_part(),
             "as_insert" => self.open_file_dialog(Purpose::InsertPart),
@@ -895,11 +907,12 @@ impl App {
                 items.push("Delete");
             }
             Sel::Comp(_) => {
-                items.extend(["Edit Part", "Properties", "Duplicate", "Fix / Unfix", "Hide / Show", "Delete"]);
+                items.extend(["Edit Part", "Properties", "Appearance", "Duplicate", "Fix / Unfix", "Hide / Show", "Delete"]);
             }
+            Sel::Root if self.part().is_some() => items.push("Appearance"),
             Sel::Constraint(_) => items.extend(["Edit", "Delete"]),
             Sel::Plane(_) => items.push("Sketch on this plane"),
-            Sel::Face { .. } => items.extend(["Sketch on this face", "Hole here", "Measure from here"]),
+            Sel::Face { .. } => items.extend(["Sketch on this face", "Hole here", "Measure from here", "Appearance"]),
             _ => {}
         }
         if items.is_empty() {
@@ -941,6 +954,8 @@ impl App {
                 }
                 ("Delete", _) => self.delete_selection(),
                 ("Edit Part", Sel::Comp(id)) => self.edit_component(id),
+                ("Appearance", Sel::Comp(id)) => self.dialog = Dialog::Appearance(Some(id)),
+                ("Appearance", _) => self.dialog = Dialog::Appearance(None),
                 ("Duplicate", Sel::Comp(id)) => self.duplicate_component(id),
                 ("Fix / Unfix", Sel::Comp(id)) => self.toggle_fix(id),
                 ("Hide / Show", Sel::Comp(id)) => {
@@ -979,6 +994,7 @@ impl App {
             ("v_normal", "Normal To"),
             ("v_proj", if self.view.persp { "Perspective" } else { "Parallel" }),
             ("v_edges", "Edges"),
+            ("v_render", "Realistic"),
         ];
         let bw = 36.0;
         let total = items.len() as f32 * (bw + 3.0);
@@ -992,7 +1008,7 @@ impl App {
         let mut clicked = None;
         for (i, (id, label)) in items.iter().enumerate() {
             let r = Rect::new(x0 + i as f32 * (bw + 3.0), y, bw, bw);
-            let active = (*id == "v_edges" && self.show_edges) || (*id == "v_proj" && !self.view.persp);
+            let active = (*id == "v_edges" && self.show_edges && !self.realistic) || (*id == "v_proj" && !self.view.persp) || (*id == "v_render" && self.realistic);
             self.ui.reg(id, r);
             self.ui.block(r);
             let hot = self.ui.hover(r);
@@ -1010,6 +1026,7 @@ impl App {
                 "v_bottom" => "Bottom View",
                 "v_normal" => "Normal View (look straight at the selected plane, face or sketch)",
                 "v_proj" => "Perspective / Parallel projection",
+                "v_render" => "Realistic Rendering on/off (R): each part with its finish\n(plastic, 3D print, metal, wood: set it in Appearance)",
                 _ => "Shading with Edges on/off",
             };
             let _ = label;
@@ -1067,7 +1084,14 @@ impl App {
                 None => self.err("Normal To: select a plane or a sketch first."),
             },
             Some("v_proj") => self.view.persp = !self.view.persp,
-            Some("v_edges") => self.show_edges = !self.show_edges,
+            Some("v_edges") => {
+                self.show_edges = !self.show_edges;
+                if self.realistic {
+                    self.realistic = false;
+                    self.show_edges = true;
+                }
+            }
+            Some("v_render") => self.toggle_realistic(),
             _ => {}
         }
     }
@@ -1137,6 +1161,10 @@ impl App {
             Dialog::Constraint(i) => {
                 let i = *i;
                 self.constraint_dialog(i);
+            }
+            Dialog::Appearance(t) => {
+                let t = *t;
+                self.appearance_dialog(t);
             }
             Dialog::Dim(i) => {
                 let i = *i;
@@ -1790,7 +1818,7 @@ impl App {
                 return;
             }
         };
-        let r = self.dialog_rect(24.0 + 10.0 * 30.0 + 100.0);
+        let r = self.dialog_rect(24.0 + 10.0 * 30.0 + 150.0);
         self.ui.panel(r, Some("Component Properties"));
         let lx = r.x + 10.0;
         let fx = r.x + 140.0;
@@ -1834,19 +1862,36 @@ impl App {
         }
         y += 30.0;
         text("Colour", lx, y + 17.0, 16, C_TEXT);
-        let mut color = c.part.color;
+        let mut look = (c.part.color, c.part.finish);
+        let mut look_changed = false;
         for (i, p) in PALETTE.iter().enumerate() {
             let sr = Rect::new(fx + i as f32 * 21.0, y + 2.0, 18.0, 20.0);
             self.ui.reg(&format!("comp_col{}", i), sr);
             draw_rectangle(sr.x, sr.y, sr.w, sr.h, Color::new(p[0], p[1], p[2], 1.0));
-            let cur = (p[0] - color[0]).abs() < 0.01 && (p[1] - color[1]).abs() < 0.01 && (p[2] - color[2]).abs() < 0.01;
+            let cur = same_color(*p, look.0);
             draw_rectangle_lines(sr.x, sr.y, sr.w, sr.h, if cur { 3.0 } else { 1.0 }, if cur { C_SEL } else { C_BORDER });
             if self.ui.clicked(sr) {
-                color = *p;
-                changed_other = true;
+                look.0 = *p;
+                look_changed = true;
             }
         }
+        y += 28.0;
+        if self.ui.button("comp_look", Rect::new(fx, y, fw, 24.0), "More Colours...") {
+            self.dialog = Dialog::Appearance(Some(id));
+            return;
+        }
+        y += 32.0;
+        text("Finish", lx, y + 15.0, 16, C_TEXT);
+        y += 22.0;
+        let mut fi = look.1.index();
+        if self.ui.choice("comp_finish", Rect::new(lx, y, r.w - 20.0, 24.0), &Finish::ALL.map(|f| f.name()), &mut fi) {
+            look.1 = Finish::ALL[fi];
+            look_changed = true;
+        }
         y += 34.0;
+        if look_changed {
+            self.set_look(Some(id), look.0, look.1);
+        }
         if self.ui.button("comp_edit", Rect::new(lx, y, 140.0, 28.0), "Edit Part") {
             self.edit_component(id);
             return;
@@ -1868,7 +1913,6 @@ impl App {
                 cm.part.name = name.clone();
                 cm.name = format!("{} ({}.{})", name, name, 1);
                 cm.fixed = fixed;
-                cm.part.color = color;
                 if changed_pose {
                     cm.pos = pos;
                     cm.rot = DQuat::from_euler(EulerRot::XYZ, e[0].to_radians(), e[1].to_radians(), e[2].to_radians());
@@ -1891,6 +1935,151 @@ impl App {
                 let m = probs.join("; ");
                 self.err(&m);
             }
+        }
+    }
+
+    /// Opens the appearance of the selected component, or of the part being edited.
+    pub fn open_appearance(&mut self) {
+        match self.sel {
+            Sel::Comp(id) if self.active_comp.is_none() => self.dialog = Dialog::Appearance(Some(id)),
+            _ if self.part().is_some() => self.dialog = Dialog::Appearance(None),
+            _ => self.err("Appearance: select a component first."),
+        }
+    }
+
+    pub fn toggle_realistic(&mut self) {
+        self.realistic = !self.realistic;
+        self.say(if self.realistic {
+            "Realistic rendering: each part shows its finish (set colour and finish in Appearance)."
+        } else {
+            "Technical shading with edges."
+        });
+    }
+
+    /// Sets the colour and finish of a component (Some) or of the part being edited (None).
+    fn set_look(&mut self, target: Option<u32>, color: [f32; 3], finish: Finish) {
+        // one undo step per click or typed value, not one per frame while a slider is dragged
+        if self.ui.inp.pressed[LMB] || self.ui.drag.is_none() {
+            self.checkpoint();
+        } else {
+            self.dirty = true;
+        }
+        let part = match target {
+            Some(id) => self.product_mut().and_then(|p| p.comp_mut(id)).map(|c| &mut c.part),
+            None => self.part_mut(),
+        };
+        let Some(p) = part else { return };
+        let finish_changed = p.finish != finish;
+        p.color = color;
+        p.finish = finish;
+        if finish_changed && !self.realistic {
+            self.realistic = true;
+            self.say("Realistic rendering switched on to show the finish (R or the view toolbar switches back).");
+        }
+    }
+
+    /// Colour (swatches, RGB sliders, hex code) and finish editor.
+    /// Returns whether anything changed and the height used.
+    fn appearance_editor(&mut self, id: &str, x: f32, y0: f32, w: f32, color: &mut [f32; 3], finish: &mut Finish) -> (bool, f32) {
+        let mut changed = false;
+        let mut y = y0;
+        text("Colour", x, y + 15.0, 16, C_ACCENT);
+        y += 22.0;
+        let per_row = 8;
+        let sw_ = (w - (per_row - 1) as f32 * 4.0) / per_row as f32;
+        for (i, p) in SWATCHES.iter().enumerate() {
+            let r = Rect::new(x + (i % per_row) as f32 * (sw_ + 4.0), y + (i / per_row) as f32 * 24.0, sw_, 20.0);
+            self.ui.reg(&format!("{}_sw{}", id, i), r);
+            self.ui.block(r);
+            draw_rectangle(r.x, r.y, r.w, r.h, Color::new(p[0], p[1], p[2], 1.0));
+            let cur = same_color(*p, *color);
+            draw_rectangle_lines(r.x, r.y, r.w, r.h, if cur { 3.0 } else { 1.0 }, if cur { C_SEL } else { C_BORDER });
+            if self.ui.clicked(r) {
+                *color = *p;
+                changed = true;
+            }
+        }
+        y += ((SWATCHES.len() + per_row - 1) / per_row) as f32 * 24.0 + 6.0;
+        let tracks = [Color::new(0.85, 0.25, 0.22, 1.0), Color::new(0.3, 0.75, 0.3, 1.0), Color::new(0.3, 0.5, 0.95, 1.0)];
+        for (k, label) in ["R", "G", "B"].iter().enumerate() {
+            text(label, x, y + 15.0, 16, C_TEXT);
+            let mut v = color[k];
+            if self.ui.slider(&format!("{}_rgb{}", id, k), Rect::new(x + 22.0, y, w - 70.0, 20.0), &mut v, 0.0, 1.0, tracks[k]) {
+                color[k] = v;
+                changed = true;
+            }
+            text(&format!("{}", (v * 255.0).round()), x + w - 38.0, y + 15.0, 15, C_DIM);
+            y += 24.0;
+        }
+        text("Hex", x, y + 17.0, 16, C_TEXT);
+        let mut hex = format!("#{:02X}{:02X}{:02X}", (color[0] * 255.0).round() as u8, (color[1] * 255.0).round() as u8, (color[2] * 255.0).round() as u8);
+        if self.ui.text_field(&format!("{}_hex", id), Rect::new(x + 40.0, y, 100.0, 24.0), &mut hex) {
+            match parse_color(&hex) {
+                Some(c) => {
+                    *color = c;
+                    changed = true;
+                }
+                None => self.err("Colour: type #RRGGBB (e.g. #3A7BD5) or R,G,B from 0 to 255."),
+            }
+        }
+        draw_rectangle(x + 150.0, y, w - 150.0, 24.0, Color::new(color[0], color[1], color[2], 1.0));
+        draw_rectangle_lines(x + 150.0, y, w - 150.0, 24.0, 1.0, C_BORDER);
+        y += 34.0;
+        text("Finish", x, y + 15.0, 16, C_ACCENT);
+        y += 22.0;
+        let mut fi = finish.index();
+        if self.ui.choice(&format!("{}_fin", id), Rect::new(x, y, w, 26.0), &Finish::ALL.map(|f| f.name()), &mut fi) {
+            *finish = Finish::ALL[fi];
+            changed = true;
+        }
+        y += 32.0;
+        let hint = match finish {
+            Finish::Plastic => "Smooth, slightly glossy plastic.",
+            Finish::Print3D => "Matte print; layer lines show up close.",
+            Finish::Metal => "Brushed metal: grey steel, gold brass.",
+            Finish::Wood => "Wood grain: grey is oak, colours stain it.",
+        };
+        text(hint, x, y + 12.0, 14, C_DIM);
+        text("Shown in Realistic Rendering (R).", x, y + 30.0, 14, C_DIM);
+        y += 40.0;
+        (changed, y - y0)
+    }
+
+    fn appearance_dialog(&mut self, target: Option<u32>) {
+        let found = match target {
+            Some(id) => self.product().and_then(|p| p.comp(id)).map(|c| (c.name.clone(), c.part.color, c.part.finish)),
+            None => self.part().map(|p| (p.name.clone(), p.color, p.finish)),
+        };
+        let Some((name, mut color, mut finish)) = found else {
+            self.dialog = Dialog::None;
+            return;
+        };
+        let in_asm = target.is_some();
+        let r = self.dialog_rect(30.0 + 24.0 + 276.0 + if in_asm { 34.0 } else { 0.0 } + 44.0);
+        self.ui.panel(r, Some("Appearance"));
+        let (x, w) = (r.x + 10.0, r.w - 20.0);
+        let mut y = r.y + 30.0;
+        text(&fit_tail(&name, w, 15), x, y + 14.0, 15, C_TEXT);
+        y += 24.0;
+        let (changed, used) = self.appearance_editor("app", x, y, w, &mut color, &mut finish);
+        y += used;
+        if changed {
+            self.set_look(target, color, finish);
+        }
+        if in_asm {
+            if self.ui.button("app_all", Rect::new(x, y, w, 26.0), "Use This Finish for All Components") {
+                self.checkpoint();
+                if let Some(pr) = self.product_mut() {
+                    for c in &mut pr.comps {
+                        c.part.finish = finish;
+                    }
+                }
+                self.realistic = true;
+                self.say(&format!("All components are {} now (realistic rendering is on).", finish.name().to_lowercase()));
+            }
+        }
+        if self.ui.button("app_close", Rect::new(r.x + r.w - 96.0, r.y + r.h - 36.0, 86.0, 28.0), "Close") {
+            self.dialog = Dialog::None;
         }
     }
 
@@ -2035,12 +2224,17 @@ impl App {
             "  Move drags parts; Contact, Offset, Coincidence and Angle snap faces",
             "  together (click a face on the part to move first). Fix anchors a part.",
             "",
+            "LOOK",
+            "  Appearance (palette button, or right-click): colour and finish of a part or",
+            "  component: plastic, 3D print, metal or wood. Realistic Rendering (R, or the",
+            "  ball in the view toolbar) shows the finishes; press R again for shading with edges.",
+            "",
             "FILES",
             "  Save keeps parts (.bcpart) and assemblies (.bcasm) fully editable.",
             "  Export STL for 3D printers (millimetres), OBJ for game engines.",
             "  Import STL/OBJ brings meshes in (e.g. parts exported from other CAD).",
             "",
-            "KEYS  Ctrl+Z undo, Ctrl+Y redo, Ctrl+S save, Del delete, Esc cancel, F fit",
+            "KEYS  Ctrl+Z undo, Ctrl+Y redo, Ctrl+S save, Del delete, Esc cancel, F fit, R realistic",
             "      Ctrl + / Ctrl - / Ctrl 0: interface size (also Tools > Options, e.g. for 4K).",
             "Number fields accept maths and units: 20*3, 1.5in, 2cm.",
         ];
@@ -2060,6 +2254,27 @@ impl App {
 }
 
 // ------------------------------------------------------------ icons
+
+fn same_color(a: [f32; 3], b: [f32; 3]) -> bool {
+    (0..3).all(|k| (a[k] - b[k]).abs() < 0.01)
+}
+
+/// A colour typed as #RRGGBB / RRGGBB / #RGB, or as R,G,B from 0 to 255.
+pub fn parse_color(s: &str) -> Option<[f32; 3]> {
+    let t = s.trim();
+    if t.contains(',') {
+        let v: Vec<f32> = t.split(',').map(|x| x.trim().parse::<f32>()).collect::<Result<_, _>>().ok()?;
+        return (v.len() == 3 && v.iter().all(|x| (0.0..=255.0).contains(x))).then(|| [v[0] / 255.0, v[1] / 255.0, v[2] / 255.0]);
+    }
+    let h = t.trim_start_matches('#');
+    let h: String = match h.len() {
+        3 => h.chars().flat_map(|c| [c, c]).collect(),
+        6 => h.to_string(),
+        _ => return None,
+    };
+    let n = u32::from_str_radix(&h, 16).ok()?;
+    Some([((n >> 16) & 255) as f32 / 255.0, ((n >> 8) & 255) as f32 / 255.0, (n & 255) as f32 / 255.0])
+}
 
 fn ln(x1: f32, y1: f32, x2: f32, y2: f32, t: f32, c: Color) {
     draw_line(x1, y1, x2, y2, t, c);
@@ -2452,6 +2667,14 @@ pub fn draw_icon(id: &str, cx: f32, cy: f32) {
             draw_arc(cx, cy, 24, 10.0, 30.0, 3.0, 290.0, sk);
             draw_triangle(vec2(cx + 9.0, cy - 10.0), vec2(cx + 13.0, cy - 2.0), vec2(cx + 4.0, cy - 3.0), sk);
         }
+        "tb_appear" | "as_appear" => {
+            // a painter's palette
+            draw_circle(cx, cy, 12.0, Color::new(0.86, 0.72, 0.5, 1.0));
+            draw_circle(cx + 5.0, cy + 5.0, 3.5, Color::new(0.2, 0.22, 0.26, 1.0));
+            for (dx, dy, c) in [(-6.0f32, -4.0f32, Color::new(0.85, 0.2, 0.15, 1.0)), (0.0, -8.0, Color::new(0.95, 0.8, 0.1, 1.0)), (6.0, -4.0, Color::new(0.2, 0.6, 0.25, 1.0)), (-6.0, 4.0, Color::new(0.2, 0.4, 0.9, 1.0))] {
+                draw_circle(cx + dx, cy + dy, 2.6, c);
+            }
+        }
         _ => draw_circle_lines(cx, cy, 8.0, 1.5, dark),
     }
 }
@@ -2508,6 +2731,13 @@ fn draw_view_icon(id: &str, cx: f32, cy: f32) {
         }
         "v_proj" => {
             quad(&[c(-6.0, -9.0), c(6.0, -9.0), c(11.0, 9.0), c(-11.0, 9.0)], face);
+        }
+        "v_render" => {
+            // a shiny ball: dark rim, lit body, bright highlight
+            draw_circle(cx, cy, 11.0, Color::new(0.25, 0.3, 0.4, 1.0));
+            draw_circle(cx - 1.5, cy - 1.5, 9.0, Color::new(0.45, 0.55, 0.72, 1.0));
+            draw_circle(cx - 3.0, cy - 3.0, 6.0, Color::new(0.65, 0.74, 0.88, 1.0));
+            draw_circle(cx - 4.5, cy - 4.5, 2.5, WHITE);
         }
         _ => {
             cube(None);
@@ -2582,6 +2812,22 @@ fn draw_tree_icon(icon: &str, cx: f32, cy: f32) {
                     }
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_color;
+    #[test]
+    fn colours_typed_in() {
+        let near = |a: [f32; 3], b: [f32; 3]| (0..3).all(|k| (a[k] - b[k]).abs() < 1e-6);
+        assert!(near(parse_color("#3A7BD5").unwrap(), [58.0 / 255.0, 123.0 / 255.0, 213.0 / 255.0]));
+        assert!(near(parse_color("3a7bd5").unwrap(), [58.0 / 255.0, 123.0 / 255.0, 213.0 / 255.0]));
+        assert!(near(parse_color("#fff").unwrap(), [1.0, 1.0, 1.0]));
+        assert!(near(parse_color(" 255, 128, 0 ").unwrap(), [1.0, 128.0 / 255.0, 0.0]));
+        for bad in ["", "#12345", "red", "300,0,0", "1,2", "#GGGGGG"] {
+            assert!(parse_color(bad).is_none(), "{}", bad);
         }
     }
 }

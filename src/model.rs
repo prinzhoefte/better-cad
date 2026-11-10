@@ -185,6 +185,35 @@ pub struct Feature {
     pub suppressed: bool,
 }
 
+/// The surface finish a part is shown with in realistic rendering.
+#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Debug, Default)]
+pub enum Finish {
+    /// neutral, smooth plastic
+    #[default]
+    Plastic,
+    /// FDM 3D print: matte with fine layer lines
+    Print3D,
+    /// machined metal (the colour sets which: grey steel, gold brass, ...)
+    Metal,
+    /// wood grain (the default grey shows natural oak; other colours stain it)
+    Wood,
+}
+
+impl Finish {
+    pub const ALL: [Finish; 4] = [Finish::Plastic, Finish::Print3D, Finish::Metal, Finish::Wood];
+    pub fn name(self) -> &'static str {
+        match self {
+            Finish::Plastic => "Plastic",
+            Finish::Print3D => "3D Print",
+            Finish::Metal => "Metal",
+            Finish::Wood => "Wood",
+        }
+    }
+    pub fn index(self) -> usize {
+        Finish::ALL.iter().position(|f| *f == self).unwrap_or(0)
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct PartCache {
     /// body after each feature
@@ -204,6 +233,8 @@ pub struct Part {
     pub next_id: u32,
     pub counters: HashMap<String, u32>,
     pub color: [f32; 3],
+    #[serde(default)]
+    pub finish: Finish,
     #[serde(skip)]
     pub cache: PartCache,
     /// bumped on every change, so a background rebuild of an older state is thrown away
@@ -233,7 +264,7 @@ pub const DEFAULT_PART_COLOR: [f32; 3] = [0.72, 0.74, 0.78];
 
 impl Part {
     pub fn new(name: &str) -> Part {
-        let mut p = Part { name: name.into(), features: vec![], next_id: 1, counters: HashMap::new(), color: DEFAULT_PART_COLOR, cache: PartCache::default(), version: 0, job: JobSlot::default() };
+        let mut p = Part { name: name.into(), features: vec![], next_id: 1, counters: HashMap::new(), color: DEFAULT_PART_COLOR, finish: Finish::Plastic, cache: PartCache::default(), version: 0, job: JobSlot::default() };
         p.cache.dirty = true;
         p
     }
@@ -519,8 +550,8 @@ fn direct_body(kind: &FeatureKind, body: &Solid) -> Option<Result<Solid, String>
             let m = Mesh::from_solid(body);
             let sharp = sharp_edges(&m);
             let segs = selected_segments(&sharp, edges)?;
-            let (cut, add) = edge_tools(&sharp, &segs, *size, matches!(kind, FeatureKind::Chamfer { .. }));
-            Ok(body.subtract(&cut).union(&add))
+            let (cut, add) = edge_tools(&m, &sharp, &segs, *size, matches!(kind, FeatureKind::Chamfer { .. }));
+            Ok(apply_edge_tools(body, &cut, &add))
         })(),
         FeatureKind::Draft { faces, angle, neutral, reverse } => (|| {
             need_body()?;
@@ -894,6 +925,7 @@ pub struct Product {
     pub counters: HashMap<String, u32>,
 }
 
+/// Colours new assembly components get, in turn.
 pub const PALETTE: [[f32; 3]; 8] = [
     [0.72, 0.74, 0.78],
     [0.86, 0.72, 0.50],
@@ -903,6 +935,27 @@ pub const PALETTE: [[f32; 3]; 8] = [
     [0.78, 0.66, 0.88],
     [0.90, 0.85, 0.55],
     [0.55, 0.82, 0.82],
+];
+
+/// Ready-made colours offered in the appearance editor (the palette above, then strong
+/// colours and common materials).
+pub const SWATCHES: [[f32; 3]; 16] = [
+    [0.72, 0.74, 0.78],
+    [0.86, 0.72, 0.50],
+    [0.55, 0.70, 0.88],
+    [0.60, 0.80, 0.58],
+    [0.88, 0.60, 0.60],
+    [0.78, 0.66, 0.88],
+    [0.90, 0.85, 0.55],
+    [0.55, 0.82, 0.82],
+    [0.95, 0.95, 0.93],
+    [0.15, 0.15, 0.17],
+    [0.80, 0.12, 0.10],
+    [0.95, 0.45, 0.08],
+    [0.98, 0.80, 0.10],
+    [0.10, 0.55, 0.22],
+    [0.10, 0.30, 0.75],
+    [0.85, 0.62, 0.28],
 ];
 
 impl Product {
@@ -1176,6 +1229,25 @@ mod tests {
         let bad = edges.values().filter(|c| **c != 2).count();
         println!("holes plate: {} tris, {} non-manifold edges, {:?}", mq.tris.len(), bad, t.elapsed());
         assert_eq!(bad, 0);
+    }
+
+    #[test]
+    fn appearance_saved_and_old_files_load() {
+        let mut p = Part::new("A");
+        p.color = [0.1, 0.2, 0.3];
+        p.finish = Finish::Wood;
+        let json = serde_json::to_string(&Doc::Part(p)).unwrap();
+        match serde_json::from_str::<Doc>(&json).unwrap() {
+            Doc::Part(q) => assert!(q.finish == Finish::Wood && q.color == [0.1, 0.2, 0.3]),
+            _ => panic!(),
+        }
+        // files saved before finishes existed open as plastic
+        let old = json.replace(",\"finish\":\"Wood\"", "");
+        assert!(!old.contains("finish"), "{}", old);
+        match serde_json::from_str::<Doc>(&old).unwrap() {
+            Doc::Part(q) => assert_eq!(q.finish, Finish::Plastic),
+            _ => panic!(),
+        }
     }
 
     #[test]

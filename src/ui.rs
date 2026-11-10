@@ -89,6 +89,8 @@ pub struct Ui {
     pub select_all: bool,
     /// a focused field that lost focus this frame commits its value once
     pending_commit: Option<String>,
+    /// the slider being dragged
+    pub drag: Option<String>,
 }
 
 // The interface font: Noto Sans (SIL Open Font License, see assets/fonts/OFL.txt), built into
@@ -211,6 +213,7 @@ impl Ui {
             font_size: 16,
             select_all: false,
             pending_commit: None,
+            drag: None,
         }
     }
 
@@ -219,6 +222,9 @@ impl Ui {
         self.prev_rects = std::mem::take(&mut self.rects);
         self.prev_ids = std::mem::take(&mut self.ids);
         self.tooltip = None;
+        if !self.inp.down[LMB] {
+            self.drag = None;
+        }
         // clicking anywhere outside the focused field ends editing
         if self.inp.pressed[LMB] {
             if let Some(f) = &self.focus {
@@ -295,6 +301,34 @@ impl Ui {
             return true;
         }
         false
+    }
+
+    /// Horizontal slider for a value from lo to hi: click or drag along it. `fill` colours the
+    /// part of the track up to the value. Returns true when the value changed.
+    pub fn slider(&mut self, id: &str, r: Rect, v: &mut f32, lo: f32, hi: f32, fill: Color) -> bool {
+        self.reg(id, r);
+        self.block(r);
+        if self.clicked(r) {
+            self.drag = Some(id.to_string());
+        }
+        let dragging = self.drag.as_deref() == Some(id);
+        let mut changed = false;
+        if dragging && self.inp.down[LMB] {
+            let f = ((self.inp.mouse.x - r.x) / r.w).clamp(0.0, 1.0);
+            let nv = lo + (hi - lo) * f;
+            if (nv - *v).abs() > 1e-6 {
+                *v = nv;
+                changed = true;
+            }
+        }
+        let f = ((*v - lo) / (hi - lo)).clamp(0.0, 1.0);
+        let ty = r.y + r.h / 2.0;
+        draw_rectangle(r.x, ty - 3.0, r.w, 6.0, C_FIELD);
+        draw_rectangle(r.x, ty - 3.0, r.w * f, 6.0, fill);
+        draw_rectangle_lines(r.x, ty - 3.0, r.w, 6.0, 1.0, C_BORDER);
+        let knob = if dragging || self.hover(r) { C_SEL } else { C_TEXT };
+        draw_circle(r.x + r.w * f, ty, 7.0, knob);
+        changed
     }
 
     /// A row of mutually exclusive choices. Returns true when changed.

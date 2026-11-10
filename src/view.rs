@@ -1,6 +1,8 @@
-//! 3D view: orbit camera, shaded rendering with a lit material, edges, picking rays.
+//! 3D view: orbit camera, shaded rendering with a lit material, realistic rendering with
+//! surface finishes (plastic, 3D print, metal, wood), edges, picking rays.
 
 use crate::geom::{Aabb, Mesh};
+use crate::model::{Finish, DEFAULT_PART_COLOR};
 use glam::{DMat4, DVec3};
 use macroquad::prelude::*;
 use crate::ui::{sh, sw};
@@ -155,8 +157,13 @@ pub struct RenderMesh {
 
 pub struct Renderer {
     pub material: Material,
+    /// realistic rendering with surface finishes
+    pub real: Material,
     pub cache: HashMap<(usize, [u8; 3]), (RenderMesh, u64)>,
     pub frame: u64,
+    /// model units per pixel at the view target and parallel projection (for `real`)
+    px: f32,
+    ortho: bool,
 }
 
 const VS: &str = r#"#version 100
@@ -193,6 +200,157 @@ void main() {
 }
 "#;
 
+// Realistic rendering: physically based lighting (GGX highlights, Fresnel reflections of a
+// photo-studio surrounding, ACES tone mapping) and procedural surface finishes worked out
+// from the part's own coordinates, so the texture moves with the part.
+const VS_REAL: &str = r#"#version 100
+attribute vec3 position;
+attribute vec2 texcoord;
+attribute vec4 color0;
+attribute vec4 normal;
+varying lowp vec4 color;
+varying highp vec3 wn;
+varying highp vec3 wp;
+varying highp vec3 lp;
+varying highp vec3 wz;
+uniform mat4 Model;
+uniform mat4 Projection;
+void main() {
+    vec4 w = Model * vec4(position, 1.0);
+    gl_Position = Projection * w;
+    color = color0 / 255.0;
+    wn = (Model * vec4(normal.xyz, 0.0)).xyz;
+    wp = w.xyz;
+    lp = position;
+    wz = (Model * vec4(0.0, 0.0, 1.0, 0.0)).xyz;
+}
+"#;
+
+const FS_REAL: &str = r#"#version 100
+precision highp float;
+varying lowp vec4 color;
+varying highp vec3 wn;
+varying highp vec3 wp;
+varying highp vec3 lp;
+varying highp vec3 wz;
+uniform vec3 LightDir;
+uniform vec3 FillDir;
+uniform vec3 Eye;
+uniform vec3 ViewBack;
+uniform vec4 Tint;
+// x: finish (0 plastic, 1 3D print, 2 metal, 3 wood), y: mm per pixel, z: parallel projection
+uniform vec4 Params;
+
+float hash(vec3 p) {
+    p = fract(p * 0.3183099 + vec3(0.71, 0.113, 0.419));
+    p *= 17.0;
+    return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
+}
+float noise(vec3 x) {
+    vec3 i = floor(x);
+    vec3 f = fract(x);
+    f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(mix(hash(i), hash(i + vec3(1.0, 0.0, 0.0)), f.x),
+                   mix(hash(i + vec3(0.0, 1.0, 0.0)), hash(i + vec3(1.0, 1.0, 0.0)), f.x), f.y),
+               mix(mix(hash(i + vec3(0.0, 0.0, 1.0)), hash(i + vec3(1.0, 0.0, 1.0)), f.x),
+                   mix(hash(i + vec3(0.0, 1.0, 1.0)), hash(i + vec3(1.0, 1.0, 1.0)), f.x), f.y), f.z);
+}
+float fbm(vec3 p) {
+    float v = 0.0;
+    float a = 0.5;
+    for (int i = 0; i < 4; i++) {
+        v += a * noise(p);
+        p = p * 2.03 + vec3(1.7, 9.2, 3.1);
+        a *= 0.5;
+    }
+    return v;
+}
+// a photo studio around the part (Z up): bright ceiling, grey horizon, dark floor and two
+// soft boxes; rougher surfaces see it more blurred
+vec3 env(vec3 d, float rough) {
+    vec3 c = mix(vec3(0.58, 0.60, 0.64), vec3(0.90, 0.92, 0.96), smoothstep(0.0, 0.9, d.z));
+    c = mix(vec3(0.15, 0.15, 0.17), c, smoothstep(-0.15 - rough * 0.3, 0.03 + rough * 0.3, d.z));
+    float w = 0.04 + rough * 0.5;
+    float k = 1.0 - rough * 0.75;
+    c += vec3(2.6) * k * smoothstep(0.96 - w, 0.985, dot(d, normalize(vec3(0.45, -0.55, 0.70))));
+    c += vec3(1.4) * k * smoothstep(0.97 - w, 0.99, dot(d, normalize(vec3(-0.70, 0.35, 0.60))));
+    return c;
+}
+void main() {
+    vec3 n = normalize(wn);
+    vec3 v = Params.z > 0.5 ? normalize(ViewBack) : normalize(Eye - wp);
+    vec3 base = mix(color.rgb, Tint.rgb, Tint.a);
+    vec3 albedo = pow(base, vec3(2.2));
+    float metal = 0.0;
+    float rough = 0.32;
+    float spec = 0.5;
+    float fin = Params.x;
+    if (fin > 2.5) {
+        // wood: growth rings around a line along the part's Y axis, warped, with fibres
+        float warp = fbm(lp * 0.06) * 2.5;
+        float r = length(lp.xz + vec2(37.0, 11.0)) * 0.35 + warp;
+        float band = pow(fract(r), 4.0);
+        float fib = noise(vec3(lp.x * 3.0, lp.y * 0.12, lp.z * 3.0));
+        albedo = mix(albedo * 1.15, albedo * 0.42, band * 0.8 + fib * 0.2);
+        rough = 0.45 + 0.15 * band;
+        spec = 0.7;
+    } else if (fin > 1.5) {
+        // metal, brushed along the part's X axis
+        metal = 1.0;
+        float brush = noise(vec3(lp.x * 0.05, lp.y * 9.0, lp.z * 9.0));
+        rough = 0.2 + 0.12 * brush;
+        albedo *= 0.92 + 0.12 * brush;
+    } else if (fin > 0.5) {
+        // FDM print: 0.2 mm layers stacked along the part's Z axis, shown once they are far
+        // enough apart on screen not to flicker
+        float h = 0.2;
+        float ph = lp.z / h * 6.2831853;
+        float vis = clamp((h / max(Params.y, 1e-4) - 1.5) / 2.5, 0.0, 1.0);
+        vec3 up = normalize(wz);
+        vec3 t = up - n * dot(up, n);
+        n = normalize(n + t * (cos(ph) * 0.45 * vis));
+        albedo *= 1.0 - 0.10 * vis * (0.5 - 0.5 * sin(ph));
+        albedo *= 0.94 + 0.06 * noise(lp * 1.7);
+        rough = 0.62;
+        spec = 0.4;
+    }
+    vec3 f0 = mix(vec3(0.08 * spec), albedo, metal);
+    vec3 diffc = albedo * (1.0 - metal);
+    float a = rough * rough;
+    float nv = max(dot(n, v), 1e-3);
+    vec3 col = vec3(0.0);
+    for (int i = 0; i < 2; i++) {
+        vec3 l = normalize(i == 0 ? LightDir : FillDir);
+        float rad = i == 0 ? 2.4 : 0.8;
+        vec3 hv = normalize(l + v);
+        float nl = max(dot(n, l), 0.0);
+        float nh = max(dot(n, hv), 0.0);
+        float vh = max(dot(v, hv), 0.0);
+        float dd = nh * nh * (a * a - 1.0) + 1.0;
+        float d = a * a / (3.14159 * dd * dd);
+        float k = (rough + 1.0) * (rough + 1.0) / 8.0;
+        float g = (nv / (nv * (1.0 - k) + k)) * (nl / (nl * (1.0 - k) + k));
+        vec3 f = f0 + (1.0 - f0) * pow(1.0 - vh, 5.0);
+        vec3 sp = f * (d * g / max(4.0 * nv * nl, 1e-3));
+        col += ((vec3(1.0) - f) * diffc / 3.14159 + sp) * nl * rad;
+    }
+    vec3 fa = f0 + (max(vec3(1.0 - rough), f0) - f0) * pow(1.0 - nv, 5.0);
+    col += diffc * (vec3(1.0) - fa) * env(n, 1.0) * 0.55;
+    col += fa * env(reflect(-v, n), rough);
+    col = (col * (2.51 * col + 0.03)) / (col * (2.43 * col + 0.59) + 0.14);
+    gl_FragColor = vec4(pow(clamp(col, 0.0, 1.0), vec3(1.0 / 2.2)), 1.0);
+}
+"#;
+
+/// The colour a part is drawn with for a finish: plain grey wood is shown as natural oak.
+pub fn finish_color(color: [f32; 3], finish: Finish) -> [f32; 3] {
+    if finish == Finish::Wood && color == DEFAULT_PART_COLOR {
+        [0.74, 0.53, 0.32]
+    } else {
+        color
+    }
+}
+
 impl Renderer {
     pub fn new() -> Renderer {
         let material = load_material(
@@ -212,7 +370,27 @@ impl Renderer {
             },
         )
         .expect("shader");
-        Renderer { material, cache: HashMap::new(), frame: 0 }
+        let real = load_material(
+            ShaderSource::Glsl { vertex: VS_REAL, fragment: FS_REAL },
+            MaterialParams {
+                pipeline_params: PipelineParams {
+                    depth_write: true,
+                    depth_test: Comparison::LessOrEqual,
+                    ..Default::default()
+                },
+                uniforms: vec![
+                    UniformDesc::new("LightDir", UniformType::Float3),
+                    UniformDesc::new("FillDir", UniformType::Float3),
+                    UniformDesc::new("Eye", UniformType::Float3),
+                    UniformDesc::new("ViewBack", UniformType::Float3),
+                    UniformDesc::new("Tint", UniformType::Float4),
+                    UniformDesc::new("Params", UniformType::Float4),
+                ],
+                ..Default::default()
+            },
+        )
+        .expect("realistic shader");
+        Renderer { material, real, cache: HashMap::new(), frame: 0, px: 0.1, ortho: false }
     }
 
     pub fn begin_frame(&mut self) {
@@ -234,6 +412,33 @@ impl Renderer {
         let f = (view.back() * 0.5 - view.up() * 0.4 + view.right() * 0.7).normalize();
         self.material.set_uniform("LightDir", l);
         self.material.set_uniform("FillDir", f);
+        self.real.set_uniform("LightDir", l);
+        self.real.set_uniform("FillDir", f);
+        self.real.set_uniform("Eye", view.eye());
+        self.real.set_uniform("ViewBack", view.back());
+    }
+
+    /// Remembers the view's scale and projection for realistic rendering.
+    pub fn set_view_scale(&mut self, view: &View) {
+        self.px = view.px_size(view.target);
+        self.ortho = !view.persp;
+    }
+
+    /// Draws a part realistically with its surface finish (tint as in `draw`).
+    pub fn draw_real(&mut self, m: &Arc<Mesh>, color: [f32; 3], finish: Finish, model: &DMat4, tint: Vec4) {
+        let color = finish_color(color, finish);
+        self.real.set_uniform("Tint", tint);
+        self.real.set_uniform("Params", vec4(finish.index() as f32, self.px, if self.ortho { 1.0 } else { 0.0 }, 0.0));
+        gl_use_material(&self.real);
+        let gl = unsafe { get_internal_gl() };
+        gl.quad_gl.push_model_matrix(model.as_mat4());
+        let rm = self.get(m, color);
+        for c in &rm.chunks {
+            draw_mesh(c);
+        }
+        let gl = unsafe { get_internal_gl() };
+        gl.quad_gl.pop_model_matrix();
+        gl_use_default_material();
     }
 
     /// Draws shaded geometry with a model matrix and tint (alpha = tint strength).
@@ -333,12 +538,17 @@ fn build_render_mesh(m: &Mesh, color: [f32; 3], only: Option<&[usize]>) -> Rende
     RenderMesh { chunks, edges }
 }
 
-/// Background gradient like a classic engineering viewport.
-pub fn draw_background() {
+/// Background gradient like a classic engineering viewport, or a light photo studio
+/// backdrop for realistic rendering.
+pub fn draw_background(studio: bool) {
     let w = sw();
     let h = sh();
-    let top = Color::new(0.07, 0.08, 0.11, 1.0);
-    let bot = Color::new(0.22, 0.26, 0.33, 1.0);
+    let (top, bot) = if studio {
+        // dark at the top, where the tree's light text sits, lighter towards the floor
+        (Color::new(0.24, 0.25, 0.28, 1.0), Color::new(0.66, 0.67, 0.70, 1.0))
+    } else {
+        (Color::new(0.07, 0.08, 0.11, 1.0), Color::new(0.22, 0.26, 0.33, 1.0))
+    };
     let steps = 48;
     for i in 0..steps {
         let t0 = i as f32 / steps as f32;
