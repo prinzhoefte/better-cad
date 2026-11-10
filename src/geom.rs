@@ -493,11 +493,14 @@ pub fn triangulate_2d(pts: &[DVec2]) -> Vec<[usize; 3]> {
                 if (p - a).length() < 1e-9 || (p - b).length() < 1e-9 || (p - c).length() < 1e-9 {
                     continue;
                 }
-                let d1 = (b - a).perp_dot(p - a);
-                let d2 = (c - b).perp_dot(p - b);
-                let d3 = (a - c).perp_dot(p - c);
-                let e = 1e-12 * scale.max(1e-12);
-                if d1 >= -e && d2 >= -e && d3 >= -e {
+                // a point on a side (within 1e-9 mm) counts as inside: clipping that ear would
+                // leave it as a zero-area sliver that gets dropped, opening a crack
+                let d1 = (b - a).perp_dot(p - a) / (b - a).length();
+                let d2 = (c - b).perp_dot(p - b) / (c - b).length();
+                let d3 = (a - c).perp_dot(p - c) / (a - c).length();
+                let e = 1e-9;
+                let in_box = p.cmpge(a.min(b).min(c) - e).all() && p.cmple(a.max(b).max(c) + e).all();
+                if in_box && d1 >= -e && d2 >= -e && d3 >= -e {
                     ok = false;
                     break;
                 }
@@ -793,24 +796,94 @@ pub struct Mesh {
     pub bbox: Aabb,
 }
 
+/// Points closer than this (mm) are welded, and a point this close to an edge is put into it.
+/// One tolerance for both: a point welded by neither but put into an edge makes a spike.
+const SNAP: f64 = 2e-4;
+
+/// Mesh edges shorter than this (mm) are collapsed: far below anything a printer can
+/// resolve, well above the booleans' rounding noise.
+const WELD: f64 = 1e-3;
+
 fn qkey(p: DVec3) -> (i64, i64, i64) {
     let s = 1e4;
     ((p.x * s).round() as i64, (p.y * s).round() as i64, (p.z * s).round() as i64)
 }
 
+/// How many triangles share each edge.
+fn edge_counts(tris: &[[u32; 3]]) -> HashMap<(u32, u32), u32> {
+    let mut count = HashMap::new();
+    for t in tris {
+        for k in 0..3 {
+            let (a, b) = (t[k], t[(k + 1) % 3]);
+            *count.entry((a.min(b), a.max(b))).or_default() += 1;
+        }
+    }
+    count
+}
+
+fn find(p: &mut [u32], mut i: u32) -> u32 {
+    while p[i as usize] != i {
+        p[i as usize] = p[p[i as usize] as usize];
+        i = p[i as usize];
+    }
+    i
+}
+
+/// Renumbers the triangles' vertices to their merged ones (union-find `parent`), dropping
+/// triangles that collapse and coincident pairs of opposite triangles (they enclose nothing),
+/// and keeping one of coinciding triangles facing the same way.
+fn merge_vertices(tris: &[[u32; 3]], normals: Vec<DVec3>, parent: &mut [u32]) -> (Vec<[u32; 3]>, Vec<DVec3>) {
+    let tris: Vec<[u32; 3]> = tris.iter().map(|t| t.map(|v| find(parent, v))).collect();
+    // sorted vertices, and whether the triangle runs the same way round as that order
+    let canon = |t: [u32; 3]| -> ([u32; 3], i32) {
+        let mut s = t;
+        s.sort_unstable();
+        let r = s.iter().position(|x| *x == t[0]).unwrap();
+        (s, if t[1] == s[(r + 1) % 3] { 1 } else { -1 })
+    };
+    let ok = |t: &[u32; 3]| t[0] != t[1] && t[1] != t[2] && t[0] != t[2];
+    let mut count: HashMap<[u32; 3], i32> = HashMap::new();
+    for t in tris.iter().filter(|t| ok(t)) {
+        let (k, o) = canon(*t);
+        *count.entry(k).or_default() += o;
+    }
+    let mut out = (Vec::new(), Vec::new());
+    for (t, n) in tris.into_iter().zip(normals) {
+        if !ok(&t) {
+            continue;
+        }
+        let (k, o) = canon(t);
+        let c = count.get_mut(&k).unwrap();
+        if *c * o > 0 {
+            *c = 0; // at most one of several coinciding ones facing the same way
+            out.0.push(t);
+            out.1.push(n);
+        }
+    }
+    out
+}
+
 impl Mesh {
     pub fn from_solid(s: &Solid) -> Mesh {
-        // 1. weld
-        let mut map: HashMap<(i64, i64, i64), u32> = HashMap::new();
+        // 1. weld points closer than SNAP. Look in the neighbouring cells too: two nearly
+        // equal points can fall into different cells, which left open edges.
+        let mut map: HashMap<(i64, i64, i64), Vec<u32>> = HashMap::new();
         let mut pos: Vec<DVec3> = Vec::new();
         let mut loops: Vec<(Vec<u32>, DVec3)> = Vec::new();
+        let ck = |p: DVec3| ((p.x / SNAP).floor() as i64, (p.y / SNAP).floor() as i64, (p.z / SNAP).floor() as i64);
         for p in &s.polys {
             let mut l: Vec<u32> = Vec::new();
             for v in &p.v {
-                let k = qkey(*v);
-                let id = *map.entry(k).or_insert_with(|| {
+                let k = ck(*v);
+                let near = (0..27).find_map(|i| {
+                    let n = (k.0 + i % 3 - 1, k.1 + i / 3 % 3 - 1, k.2 + i / 9 - 1);
+                    map.get(&n)?.iter().copied().find(|&id| (pos[id as usize] - *v).length() < SNAP)
+                });
+                let id = near.unwrap_or_else(|| {
                     pos.push(*v);
-                    (pos.len() - 1) as u32
+                    let id = (pos.len() - 1) as u32;
+                    map.entry(k).or_default().push(id);
+                    id
                 });
                 if l.last() != Some(&id) {
                     l.push(id);
@@ -851,8 +924,8 @@ impl Mesh {
                 if len2 < 1e-16 {
                     continue;
                 }
-                let lo = gk(pa.min(pb) - DVec3::splat(2e-4));
-                let hi = gk(pa.max(pb) + DVec3::splat(2e-4));
+                let lo = gk(pa.min(pb) - DVec3::splat(SNAP));
+                let hi = gk(pa.max(pb) + DVec3::splat(SNAP));
                 let cells = ((hi.0 - lo.0 + 1) * (hi.1 - lo.1 + 1) * (hi.2 - lo.2 + 1)) as usize;
                 let mut found: Vec<(f64, u32)> = Vec::new();
                 let mut test = |k: u32| {
@@ -865,7 +938,7 @@ impl Mesh {
                         return;
                     }
                     let d = (pa + ab * t - p).length();
-                    if d < 2e-4 {
+                    if d < SNAP {
                         found.push((t, k));
                     }
                 };
@@ -909,6 +982,78 @@ impl Mesh {
                     continue;
                 }
                 tris.push(tri);
+                tri_normal.push(n);
+            }
+        }
+        // 4. collapse edges shorter than WELD: the needles the booleans leave where faces meet
+        // at grazing angles (e.g. along a fillet) would otherwise be open edges in slicers
+        let mut parent: Vec<u32> = (0..pos.len() as u32).collect();
+        for t in &tris {
+            for k in 0..3 {
+                let (a, b) = (find(&mut parent, t[k]), find(&mut parent, t[(k + 1) % 3]));
+                if a != b && (pos[a as usize] - pos[b as usize]).length() < WELD {
+                    parent[a.max(b) as usize] = a.min(b);
+                }
+            }
+        }
+        let (mut tris, mut tri_normal) = merge_vertices(&tris, tri_normal, &mut parent);
+        // 5. close what is left open: slits narrower than WELD between vertices of open edges
+        for _ in 0..3 {
+            let mut open: Vec<u32> = edge_counts(&tris).iter().filter(|(_, c)| **c != 2).flat_map(|(e, _)| [e.0, e.1]).collect();
+            open.sort_unstable();
+            open.dedup();
+            let mut merged = false;
+            // ponytail: pairwise scan, fine for the handful a boolean leaves; a broken
+            // imported mesh with thousands of open edges is left as it is
+            if open.len() > 2000 {
+                break;
+            }
+            for (i, &a) in open.iter().enumerate() {
+                for &b in &open[i + 1..] {
+                    let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
+                    if ra != rb && (pos[a as usize] - pos[b as usize]).length() < WELD {
+                        parent[ra.max(rb) as usize] = ra.min(rb);
+                        merged = true;
+                    }
+                }
+            }
+            if !merged {
+                break;
+            }
+            (tris, tri_normal) = merge_vertices(&tris, tri_normal, &mut parent);
+        }
+        // 6. fill the tiny holes still left (slivers just wider than WELD): each run of open
+        // edges around one is closed with a fan of triangles
+        let count = edge_counts(&tris);
+        // the hole's border runs against the open edges of the triangles around it
+        let mut next: HashMap<u32, u32> = HashMap::new();
+        for t in &tris {
+            for k in 0..3 {
+                let (a, b) = (t[k], t[(k + 1) % 3]);
+                if count[&(a.min(b), a.max(b))] == 1 {
+                    next.insert(b, a);
+                }
+            }
+        }
+        let starts: Vec<u32> = next.keys().copied().collect();
+        for s0 in starts {
+            let mut lp = vec![s0];
+            let mut closed = false;
+            while let Some(n) = next.remove(lp.last().unwrap()) {
+                closed = n == s0;
+                if closed || lp.len() > 64 {
+                    break;
+                }
+                lp.push(n);
+            }
+            let around: f64 = (0..lp.len()).map(|i| (pos[lp[i] as usize] - pos[lp[(i + 1) % lp.len()] as usize]).length()).sum();
+            // ponytail: only small holes; a big one means a broken boolean, filling it would hide that
+            if !closed || lp.len() < 3 || around > 1.0 {
+                continue;
+            }
+            let n = Poly::new(lp.iter().map(|k| pos[*k as usize]).collect()).map_or(DVec3::Z, |p| p.plane.n);
+            for i in 1..lp.len() - 1 {
+                tris.push([lp[0], lp[i], lp[i + 1]]);
                 tri_normal.push(n);
             }
         }

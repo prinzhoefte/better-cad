@@ -485,6 +485,7 @@ fn edge_runs(edges: &[SharpEdge], segs: &[usize]) -> Vec<(Vec<(usize, bool)>, bo
 }
 
 /// A smooth run of selected edge segments, ready to be swept.
+#[derive(Clone)]
 struct Run {
     pts: Vec<DVec3>,
     /// mesh vertex of each point
@@ -530,6 +531,29 @@ impl Run {
     }
     fn length(&self) -> f64 {
         self.pts.windows(2).map(|w| (w[1] - w[0]).length()).sum()
+    }
+    /// Drops the points within `b` of the start / end (along the run) and returns what is
+    /// left of `b` past the new end point. Moving only the end ring back would fold the tool
+    /// over any point in between, and the booleans turn such a tool into garbage.
+    fn trim(&mut self, start: bool, mut b: f64) -> f64 {
+        while self.pts.len() > 2 {
+            let n = self.pts.len();
+            let l = if start { (self.pts[1] - self.pts[0]).length() } else { (self.pts[n - 1] - self.pts[n - 2]).length() };
+            if b < l {
+                break;
+            }
+            b -= l;
+            if start {
+                self.pts.remove(0);
+                self.vids.remove(0);
+                self.normals.remove(0);
+            } else {
+                self.pts.pop();
+                self.vids.pop();
+                self.normals.pop();
+            }
+        }
+        b
     }
     /// Face normals of the segment at the start / end.
     fn end_normals(&self, start: bool) -> (DVec3, DVec3) {
@@ -740,6 +764,18 @@ pub fn edge_tools(m: &Mesh, edges: &[SharpEdge], segs: &[usize], size: f64, cham
         }
     }
     for (ri, r) in runs.iter().enumerate() {
+        let mut r = r.clone();
+        let mut end_of = |start: bool| -> End {
+            match end_kind.get(&(ri, start)).copied().unwrap_or(End::Extend(eps)) {
+                End::Setback(b) if !r.closed => End::Setback(r.trim(start, b)),
+                k => k,
+            }
+        };
+        let ends = [end_of(true), end_of(false)];
+        let left = r.length() - ends.iter().map(|e| if let End::Setback(b) = e { *b } else { 0.0 }).sum::<f64>();
+        if left <= eps {
+            continue; // the corners' balls meet: nothing of this run's own tool is left
+        }
         let np = r.pts.len();
         let nseg = r.normals.len();
         let mut rings = Vec::with_capacity(np);
@@ -775,7 +811,7 @@ pub fn edge_tools(m: &Mesh, edges: &[SharpEdge], segs: &[usize], size: f64, cham
             let mut p = r.pts[i];
             let ring: Vec<DVec3> = if is_end {
                 let u = r.beyond(i == 0);
-                match end_kind.get(&(ri, i == 0)).copied().unwrap_or(End::Extend(eps)) {
+                match ends[if i == 0 { 0 } else { 1 }] {
                     End::Extend(ext) => {
                         p += u * ext;
                         sec.iter().map(|o| p + *o).collect()
@@ -1445,5 +1481,59 @@ mod corners {
         let ideal = 16.0 * (1.0 - std::f64::consts::PI / 4.0) * 30.0;
         let added = out.volume() - s.volume();
         assert!((added - ideal).abs() < 0.03 * ideal, "added {} vs {}", added, ideal);
+    }
+}
+
+#[cfg(test)]
+mod watertight {
+    use super::*;
+
+    /// Edges of the finished mesh with only one triangle: what slicers report as open edges.
+    fn open_edges(r: &Mesh) -> usize {
+        let mut map: HashMap<(u32, u32), usize> = HashMap::new();
+        for tri in &r.tris {
+            for k in 0..3 {
+                let (a, b) = (tri[k], tri[(k + 1) % 3]);
+                *map.entry((a.min(b), a.max(b))).or_default() += 1;
+            }
+        }
+        map.values().filter(|c| **c == 1).count()
+    }
+
+    /// Fillets / chamfers every edge; returns the volume the fillet took away.
+    fn check(name: &str, body: &Solid, size: f64) -> f64 {
+        let m = Mesh::from_solid(body);
+        let edges = sharp_edges(&m);
+        let refs: Vec<EdgeRef> = edges.iter().map(edge_ref).collect();
+        let segs = selected_segments(&edges, &refs).unwrap();
+        let mut removed = 0.0;
+        for chamfer in [false, true] {
+            let (cut, add) = edge_tools(&m, &edges, &segs, size, chamfer);
+            let out = apply_edge_tools(body, &cut, &add);
+            let open = open_edges(&Mesh::from_solid(&out));
+            assert_eq!(open, 0, "{} {} {}: {} open edges", name, if chamfer { "chamfer" } else { "fillet" }, size, open);
+            if !chamfer {
+                removed = body.volume() - out.volume();
+            }
+        }
+        removed
+    }
+
+    /// Every edge of parts with holes and bosses filleted / chamfered: no open edges (these
+    /// used to export with up to ~1800 of them).
+    #[test]
+    fn all_edges_stay_closed() {
+        let mut plate = box_solid(DVec3::new(-20.0, -20.0, 0.0), DVec3::new(20.0, 20.0, 8.0));
+        plate = plate.subtract(&cylinder_solid(DVec3::new(0.0, 0.0, -1.0), DVec3::Z, 5.0, 10.0));
+        plate = plate.subtract(&cylinder_solid(DVec3::new(12.0, 12.0, -1.0), DVec3::Z, 3.0, 10.0));
+        check("plate with holes", &plate, 1.0);
+        let l = box_solid(DVec3::ZERO, DVec3::new(40.0, 10.0, 10.0)).union(&box_solid(DVec3::ZERO, DVec3::new(10.0, 40.0, 10.0)));
+        check("L plate", &l, 1.0);
+        // the box's side edges have a vertex at z = 4 (where the boss starts) inside the
+        // stretch the corner balls take over; the edge tool used to fold back over it and
+        // the boolean then took away half the part
+        let boss = box_solid(DVec3::new(-15.0, -15.0, 0.0), DVec3::new(15.0, 15.0, 5.0)).union(&cylinder_solid(DVec3::new(0.0, 0.0, 4.0), DVec3::Z, 6.0, 8.0));
+        let removed = check("boss on plate", &boss, 1.5);
+        assert!(removed > 0.0 && removed < 300.0, "removed {} mm3", removed);
     }
 }
