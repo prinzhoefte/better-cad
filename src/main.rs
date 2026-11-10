@@ -130,6 +130,28 @@ impl SelfTest {
                 let face_sketch = a.part().map_or(false, |p| p.features.iter().any(|f| matches!(&f.kind, FeatureKind::Sketch(s) if s.support == "face")));
                 ((v - expect).abs() < 25.0 && face_sketch, format!("sketched a D16 circle on the top face and pocketed it 10 mm: volume {} mm3 (expected about {})", fmt(v.round()), fmt(expect.round())))
             }),
+            // constrain to the first sketch from a new sketch on the top face: clicking its
+            // (projected) right edge with Constraint adopts it as a locked reference element
+            Call(|a| a.fit_all()),
+            Wait(40),
+            ClickWorld(|_| DVec3::new(12.0, 10.0, 20.0)),
+            ClickId("tb_sketch"),
+            Wait(40),
+            ClickId("sk_constraint"),
+            ClickWorld(|_| DVec3::new(20.0, 8.0, 20.0)),
+            ClickWorld(|_| DVec3::new(28.0, 8.0, 20.0)),
+            Check("reference other sketch", |a| {
+                let s = match a.sketch_data() {
+                    Some(s) => s.clone(),
+                    None => return (false, "not in the sketcher".into()),
+                };
+                let refs = (0..s.shapes.len()).filter(|i| s.is_ext(*i)).count();
+                let d = s.dims.first().cloned();
+                let ok = refs == 1 && d.as_ref().map_or(false, |d| d.reference && (d.value - 30.0).abs() < 1e-9);
+                (ok, format!("clicked the first sketch's edge in a new sketch: {} reference element(s), dimension {}", refs, d.map(|d| d.label()).unwrap_or("none".into())))
+            }),
+            ClickId("sk_exit"),
+            Wait(10),
             // a triangle drawn from single connected lines on the side face, padded outward
             Call(|a| a.fit_all()),
             Wait(40),

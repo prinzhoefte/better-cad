@@ -219,6 +219,50 @@ impl App {
         self.sketch_frame_world().map(|f| self.view.px_size(f.o.as_vec3()) as f64).unwrap_or(1.0)
     }
 
+    /// Elements of the part's earlier sketches seen on the edited sketch's plane, except those
+    /// already referenced in it.
+    pub fn sketch_refs(&self) -> Vec<(ExtRef, Shape)> {
+        let (Some(sk), Some(part), Some(data)) = (self.sketch.as_ref(), self.part(), self.sketch_data()) else { return vec![] };
+        let mut out = vec![];
+        for f in &part.features {
+            if f.id == sk.feat {
+                break;
+            }
+            if let FeatureKind::Sketch(src) = &f.kind {
+                out.extend(data.projected(f.id, src).into_iter().filter(|(r, _)| !data.ext.contains(&Some(*r))));
+            }
+        }
+        out
+    }
+
+    /// The edited sketch with the earlier sketches' elements appended as reference elements
+    /// (for picking, measuring and snapping), and how many elements are its own.
+    pub fn sketch_with_refs(&self) -> Option<(Sketch, usize)> {
+        let mut s = self.sketch_data()?.clone();
+        let n = s.shapes.len();
+        for (r, sh) in self.sketch_refs() {
+            s.push_ext(r, sh);
+        }
+        Some((s, n))
+    }
+
+    /// Turns a pick made in `sketch_with_refs` into one in the edited sketch: an element of an
+    /// earlier sketch is added to it as a locked reference element (classic CAD "use-edge").
+    fn adopt_ref(&mut self, tmp: &Sketch, n: usize, g: GRef) -> GRef {
+        let i = match g.elem() {
+            Some(i) if i >= n => i,
+            _ => return g,
+        };
+        let (Some(r), Some(sh)) = (tmp.ext.get(i).copied().flatten(), tmp.shapes.get(i).cloned()) else { return g };
+        self.checkpoint();
+        let j = self.sketch_data_mut().map_or(i, |d| d.push_ext(r, sh));
+        self.touch_sketch();
+        match g {
+            GRef::Key(_, k) => GRef::Key(j, k),
+            _ => GRef::Elem(j),
+        }
+    }
+
     /// Element under the cursor (nearest outline, else the smallest closed shape around it).
     pub fn sketch_hover_shape(&self) -> Option<usize> {
         let sk = self.sketch.as_ref()?;
@@ -246,7 +290,10 @@ impl App {
         let data = self.sketch_data()?;
         let px = self.sketch_px();
         let mut best: Option<(f64, DVec2)> = None;
-        for s in &data.shapes {
+        for (i, s) in data.shapes.iter().enumerate() {
+            if data.is_ext(i) {
+                continue;
+            }
             for h in s.handle_points() {
                 let d = (h - p).length();
                 if d < px * 7.0 && best.map_or(true, |b| d < b.0) {
@@ -269,6 +316,8 @@ impl App {
         let px = self.sketch_px();
         let data = self.sketch_data().cloned();
         let Some(data) = data else { return };
+        let refs: Vec<Shape> = self.sketch_refs().into_iter().map(|r| r.1).collect();
+        let with_refs = self.sketch_with_refs().map_or_else(|| data.clone(), |r| r.0);
         let sk = self.sketch.as_mut().unwrap();
         if den.abs() < 1e-9 {
             sk.cursor_ok = false;
@@ -289,10 +338,12 @@ impl App {
         sk.guides.clear();
         // while dragging, snap to the sketch as it was when the drag began, so moved elements
         // never snap to themselves
-        let base: Vec<Shape> = match &sk.drag {
+        // (earlier sketches' elements are snapped to as well)
+        let mut base: Vec<Shape> = match &sk.drag {
             Some(SkDrag::Shapes { orig, .. }) | Some(SkDrag::Point { orig, .. }) => orig.clone(),
             _ => data.shapes.clone(),
         };
+        base.extend(refs);
         // movers: (position at the raw cursor, how it follows the cursor on x / y: 1, -1 or 0)
         // the first mover is the cursor itself, except while dragging whole elements
         let mut movers: Vec<(DVec2, DVec2)> = vec![(raw, DVec2::ONE)];
@@ -489,6 +540,8 @@ impl App {
             }
             SkTool::MeasureBetween | SkTool::MeasureItem => {
                 if inp.pressed[LMB] {
+                    // earlier sketches can be measured too
+                    let data = with_refs;
                     let item = pick_item(&data, raw, px * 8.0);
                     let sk = self.sketch.as_mut().unwrap();
                     let Some(item) = item else {
@@ -522,6 +575,7 @@ impl App {
             SkTool::Trim => {
                 if inp.pressed[LMB] {
                     match self.sketch_hover_shape() {
+                        Some(i) if data.is_ext(i) => self.err("That is a locked reference to an earlier sketch; delete it instead of trimming."),
                         Some(i) if data.shapes[i].distance(raw) < px * 8.0 => {
                             let mut s = data.clone();
                             match quick_trim(&mut s, i, raw) {
@@ -597,7 +651,7 @@ impl App {
                             if let Some(sd) = self.sketch_data_mut() {
                                 sd.shapes = orig.clone();
                                 for &i in &sel {
-                                    if i < sd.shapes.len() {
+                                    if i < sd.shapes.len() && !sd.is_ext(i) {
                                         let old = sd.shapes[i].handle_points();
                                         sd.shapes[i].translate(delta);
                                         // connected neighbours follow the moved end points
@@ -765,19 +819,20 @@ impl App {
                 if p.length() < JOIN_TOL {
                     return Some(GRef::Origin);
                 }
-                // prefer line end points, then any element's key point
-                let mut found = None;
+                // prefer the sketch's own elements over references, then line end points
+                let mut found: Option<(u8, GRef)> = None;
                 for (i, s) in data.shapes.iter().enumerate() {
                     for (k, q) in s.key_points().iter().enumerate() {
                         if (*q - p).length() < JOIN_TOL {
                             let is_line_end = matches!(s, Shape::Line { .. } | Shape::Axis { .. }) && k < 2;
-                            if found.is_none() || is_line_end {
-                                found = Some(GRef::Key(i, k));
+                            let rank = 2 * !data.is_ext(i) as u8 + is_line_end as u8;
+                            if found.map_or(true, |(r, _)| rank > r) {
+                                found = Some((rank, GRef::Key(i, k)));
                             }
                         }
                     }
                 }
-                found
+                found.map(|f| f.1)
             }
             MeasItem::Elem(i) => Some(GRef::Elem(i)),
             MeasItem::AxisH => Some(GRef::AxisH),
@@ -786,11 +841,13 @@ impl App {
     }
 
     fn constraint_click(&mut self, raw: DVec2, px: f64) {
+        // an element of an earlier sketch becomes a reference element when picked
+        let Some((tmp, n)) = self.sketch_with_refs() else { return };
+        let picked = self.pick_gref(&tmp, raw, px).map(|g| self.adopt_ref(&tmp, n, g));
         let data = match self.sketch_data() {
             Some(d) => d.clone(),
             None => return,
         };
-        let picked = self.pick_gref(&data, raw, px);
         let first = self.sketch.as_ref().unwrap().cons_first;
         let new_dim = match (first, picked) {
             (None, Some(g)) => {
@@ -839,6 +896,11 @@ impl App {
                 }
             }
         };
+        // nothing it could move (only references, axes, origin): it just shows the value
+        let mut new_dim = new_dim;
+        if data.locked(&new_dim.a) && new_dim.b.map_or(true, |b| data.locked(&b)) {
+            new_dim.reference = true;
+        }
         self.checkpoint();
         let name = new_dim.kind.name();
         let label = new_dim.label();
@@ -1131,8 +1193,9 @@ impl App {
             Some(f) => f,
             None => return,
         };
-        let data = match self.sketch_data() {
-            Some(d) => d.clone(),
+        // earlier sketches are drawn (faint) and picked like reference elements
+        let (data, n_own) = match self.sketch_with_refs() {
+            Some(d) => d,
             None => return,
         };
         let sk = self.sketch.as_ref().unwrap();
@@ -1186,10 +1249,17 @@ impl App {
             let sel = sk.sel.contains(&i);
             let constr = data.is_construction(i);
             let is_axis = matches!(s, Shape::Axis { .. });
+            let ext = data.is_ext(i);
             let col = if sel {
                 C_SEL
             } else if hover == Some(i) {
                 Color::new(1.0, 0.8, 0.45, 1.0)
+            } else if i >= n_own {
+                // an earlier sketch, not referenced yet
+                Color::new(0.95, 0.75, 0.30, 0.60)
+            } else if ext {
+                // a reference element from an earlier sketch (locked)
+                Color::new(1.0, 0.85, 0.20, 1.0)
             } else if fixed_set.contains(&i) && !constr {
                 // fully fixed by its constraints (like a fully constrained element)
                 Color::new(0.30, 0.92, 0.40, 1.0)
@@ -1211,13 +1281,13 @@ impl App {
             let mut dash_pos = 0.0f32;
             for k in 0..segs {
                 let (a, b) = (sp[k], sp[(k + 1) % sp.len()]);
-                if constr || is_axis {
+                if constr && !ext || is_axis {
                     dashed(a, b, w - 0.5, col, &mut dash_pos, if is_axis { 14.0 } else { 6.0 });
                 } else {
                     draw_line(a.x, a.y, b.x, b.y, w, col);
                 }
             }
-            for h in s.handle_points().into_iter().chain(s.endpoints().map(|(a, b)| vec![a, b]).unwrap_or_default()) {
+            for h in s.handle_points().into_iter().chain(s.endpoints().map(|(a, b)| vec![a, b]).unwrap_or_default()).filter(|_| !ext) {
                 if let Some(p) = to_s(h) {
                     draw_rectangle(p.x - 2.5, p.y - 2.5, 5.0, 5.0, Color::new(0.85, 0.88, 0.95, 0.9));
                 }
@@ -1229,7 +1299,7 @@ impl App {
                 }
             }
             // dimension label: closed shapes always, open elements when selected or hovered
-            if !s.is_open() || sel || hover == Some(i) {
+            if i < n_own && (!s.is_open() || sel || hover == Some(i)) {
                 let at = if s.is_open() {
                     let m = c[c.len() / 2];
                     to_s(m)
@@ -1419,8 +1489,8 @@ impl App {
             Some(f) => f,
             None => return,
         };
-        let data = match self.sketch_data() {
-            Some(d) => d.clone(),
+        let data = match self.sketch_with_refs() {
+            Some(d) => d.0,
             None => return,
         };
         let px = self.view.px_size(f.o.as_vec3()) as f64;

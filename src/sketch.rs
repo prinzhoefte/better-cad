@@ -476,14 +476,63 @@ pub struct Sketch {
     /// dimensional constraints (lengths, distances, radii, angles) that drive the geometry
     #[serde(default)]
     pub dims: Vec<crate::dims::Dim>,
+    /// reference elements projected from earlier sketches (classic CAD "use-edges"): where
+    /// each came from. They are locked, never material, and follow their source.
+    #[serde(default)]
+    pub ext: Vec<Option<ExtRef>>,
 }
+
+/// An element of another sketch: (sketch feature id, element, piece of the exploded element).
+pub type ExtRef = (u32, usize, usize);
 
 impl Sketch {
     pub fn new(frame: Frame, support: String) -> Sketch {
-        Sketch { frame, support, shapes: vec![], construction: vec![], dims: vec![] }
+        Sketch { frame, support, shapes: vec![], construction: vec![], dims: vec![], ext: vec![] }
     }
     pub fn is_construction(&self, i: usize) -> bool {
-        self.construction.get(i).copied().unwrap_or(false) || matches!(self.shapes.get(i), Some(Shape::Axis { .. }))
+        self.construction.get(i).copied().unwrap_or(false) || matches!(self.shapes.get(i), Some(Shape::Axis { .. })) || self.is_ext(i)
+    }
+    pub fn is_ext(&self, i: usize) -> bool {
+        matches!(self.ext.get(i), Some(Some(_)))
+    }
+    /// The elements of sketch `src` (feature `src_id`) seen on this sketch's plane. On a
+    /// parallel plane everything projects; on a tilted one only lines do.
+    pub fn projected(&self, src_id: u32, src: &Sketch) -> Vec<(ExtRef, Shape)> {
+        let par = src.frame.n().dot(self.frame.n());
+        let f = |p: DVec2| self.frame.to2(src.frame.to3(p, 0.0));
+        let mut out = vec![];
+        for (i, s) in src.shapes.iter().enumerate() {
+            if src.is_ext(i) {
+                continue;
+            }
+            for (k, mut piece) in s.explode().into_iter().enumerate() {
+                if (par.abs() - 1.0).abs() < 1e-9 {
+                    piece.map_points(&f, par < 0.0);
+                } else if let Shape::Line { .. } | Shape::Axis { .. } = piece {
+                    // ponytail: circles on a tilted plane would project to ellipses; skipped
+                    piece.map_points(&f, false);
+                    if piece.endpoints().map_or(true, |(a, b)| (a - b).length() < 1e-9) {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+                out.push(((src_id, i, k), piece));
+            }
+        }
+        out
+    }
+    /// Adds a reference element (or finds the one already there); returns its index.
+    pub fn push_ext(&mut self, r: ExtRef, s: Shape) -> usize {
+        if let Some(i) = self.ext.iter().position(|e| *e == Some(r)) {
+            return i;
+        }
+        self.construction.resize(self.shapes.len(), false);
+        self.ext.resize(self.shapes.len(), None);
+        self.shapes.push(s);
+        self.construction.push(true);
+        self.ext.push(Some(r));
+        self.shapes.len() - 1
     }
     pub fn set_construction(&mut self, i: usize, c: bool) {
         if self.construction.len() < self.shapes.len() {
@@ -511,8 +560,10 @@ impl Sketch {
             }
             _ => None,
         };
+        self.ext.resize(self.shapes.len(), None);
         self.shapes.push(s);
         self.construction.push(construction);
+        self.ext.push(None);
         let i = self.shapes.len() - 1;
         if let Some(kind) = hv {
             self.dims.push(crate::dims::Dim { kind, a: crate::dims::GRef::Elem(i), b: None, value: 0.0, offset: DVec2::ZERO, reference: false });
@@ -521,9 +572,11 @@ impl Sketch {
     }
     pub fn remove(&mut self, i: usize) {
         self.construction.resize(self.shapes.len(), false);
+        self.ext.resize(self.shapes.len(), None);
         if i < self.shapes.len() {
             self.shapes.remove(i);
             self.construction.remove(i);
+            self.ext.remove(i);
             self.dims_after_remove(i);
         }
     }
@@ -644,8 +697,10 @@ impl Sketch {
     /// Moves every open-element end point (and profile/spline point) at `old` to `new`, so
     /// connected elements stay connected. `skip` elements are left alone.
     pub fn move_point(&mut self, old: DVec2, new: DVec2, skip: &[usize]) {
+        let ext = &self.ext;
         for (i, s) in self.shapes.iter_mut().enumerate() {
-            if skip.contains(&i) {
+            // reference elements are locked
+            if skip.contains(&i) || matches!(ext.get(i), Some(Some(_))) {
                 continue;
             }
             let hs = s.handle_points();

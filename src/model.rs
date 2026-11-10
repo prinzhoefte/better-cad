@@ -292,9 +292,43 @@ impl Part {
 
     /// Marks feature `idx` and everything after it for rebuilding.
     pub fn touch(&mut self, idx: usize) {
+        let idx = self.refresh_ext().map_or(idx, |j| j.min(idx));
         self.cache.valid_upto = self.cache.valid_upto.min(idx);
         self.cache.dirty = true;
         self.version += 1;
+    }
+    /// Reference elements follow the sketches they were projected from (sketches that tie
+    /// their own elements to them by dimensions follow too). Returns the first changed index.
+    fn refresh_ext(&mut self) -> Option<usize> {
+        let mut first = None;
+        for j in 0..self.features.len() {
+            let mut s = match &self.features[j].kind {
+                FeatureKind::Sketch(s) if s.ext.iter().any(|e| e.is_some()) => s.clone(),
+                _ => continue,
+            };
+            let mut changed = false;
+            for i in 0..s.shapes.len() {
+                let Some(r) = s.ext.get(i).copied().flatten() else { continue };
+                // only earlier sketches can be referenced; a deleted source leaves the element where it was
+                let src = self.features[..j].iter().find(|f| f.id == r.0).and_then(|f| match &f.kind {
+                    FeatureKind::Sketch(x) => Some(x),
+                    _ => None,
+                });
+                let new = src.and_then(|src| s.projected(r.0, src).into_iter().find(|(q, _)| *q == r)).map(|x| x.1);
+                if let Some(new) = new {
+                    if new != s.shapes[i] {
+                        s.shapes[i] = new;
+                        changed = true;
+                    }
+                }
+            }
+            if changed {
+                s.solve_dims(None);
+                self.features[j].kind = FeatureKind::Sketch(s);
+                first.get_or_insert(j);
+            }
+        }
+        first
     }
     pub fn touch_id(&mut self, id: u32) {
         if let Some(i) = self.index_of(id) {
@@ -1134,6 +1168,7 @@ mod tests {
             shapes: vec![Shape::Rect { cx: 0.0, cy: 0.0, w: 40.0, h: 30.0, r: 0.0 }],
             construction: vec![],
             dims: vec![],
+            ext: vec![],
         }));
         p.add_feature(FeatureKind::Pad { sketch: s, length: 20.0, symmetric: false, reverse: false });
         let m = p.mesh();
@@ -1144,6 +1179,7 @@ mod tests {
             shapes: vec![Shape::Circle { cx: 0.0, cy: 0.0, r: 8.0 }],
             construction: vec![],
             dims: vec![],
+            ext: vec![],
         }));
         p.add_feature(FeatureKind::Pocket { sketch: s2, depth: 10.0, through: false, reverse: false });
         let m = p.mesh();
@@ -1188,6 +1224,7 @@ mod tests {
             shapes: vec![Shape::Rect { cx: 10.0, cy: 15.0, w: 10.0, h: 30.0, r: 0.0 }],
             construction: vec![],
             dims: vec![],
+            ext: vec![],
         }));
         let shaft = p.add_feature(FeatureKind::Shaft { sketch: s, angle: 360.0, axis_h: false });
         let m = p.mesh();
@@ -1261,9 +1298,44 @@ mod tests {
         p.touch_id(split);
         assert!((p.mesh().volume() - 6000.0).abs() < 1e-6);
         // a 2 mm stiffener line on top, reaching 3 mm up from z = 20 (reversed: along +Z)
-        let s = p.add_feature(FeatureKind::Sketch(Sketch { frame: Frame { o: DVec3::new(0.0, 0.0, 20.0), u: DVec3::X, v: DVec3::Y }, support: "face".into(), shapes: vec![Shape::Line { x1: -10.0, y1: 0.0, x2: 10.0, y2: 0.0 }], construction: vec![], dims: vec![] }));
+        let s = p.add_feature(FeatureKind::Sketch(Sketch { frame: Frame { o: DVec3::new(0.0, 0.0, 20.0), u: DVec3::X, v: DVec3::Y }, support: "face".into(), shapes: vec![Shape::Line { x1: -10.0, y1: 0.0, x2: 10.0, y2: 0.0 }], construction: vec![], dims: vec![], ext: vec![] }));
         p.add_feature(FeatureKind::Stiffener { sketch: s, thickness: 2.0, depth: 3.0, reverse: true });
         assert!((p.mesh().volume() - 6120.0).abs() < 1e-6, "{}", p.mesh().volume());
         assert!(p.cache.errors.is_empty());
+    }
+
+    #[test]
+    fn reference_to_earlier_sketch_follows_it() {
+        use crate::dims::{Dim, DimKind, GRef};
+        let mut p = Part::new("P");
+        let s1 = p.add_feature(FeatureKind::Sketch(Sketch { frame: Frame::xy(), support: "xy".into(), shapes: vec![Shape::Rect { cx: 0.0, cy: 0.0, w: 40.0, h: 30.0, r: 0.0 }], construction: vec![], dims: vec![], ext: vec![] }));
+        let mut top = Sketch::new(Frame { o: DVec3::new(0.0, 0.0, 20.0), u: DVec3::X, v: DVec3::Y }, "face".into());
+        let c = top.push(Shape::Circle { cx: 10.0, cy: 0.0, r: 3.0 }, false);
+        // the rectangle's right edge (piece 1 of the exploded rectangle), x = 20
+        let src = match &p.feature(s1).unwrap().kind {
+            FeatureKind::Sketch(s) => s.clone(),
+            _ => unreachable!(),
+        };
+        let (r, edge) = top.projected(s1, &src).into_iter().find(|(r, _)| r.2 == 1).unwrap();
+        assert_eq!(edge, Shape::Line { x1: 20.0, y1: -15.0, x2: 20.0, y2: 15.0 });
+        let e = top.push_ext(r, edge);
+        assert_eq!(top.push_ext(r, Shape::Circle { cx: 0.0, cy: 0.0, r: 1.0 }), e, "adopting twice reuses the reference");
+        top.dims.push(Dim { kind: DimKind::Distance, a: GRef::Key(c, 0), b: Some(GRef::Elem(e)), value: 5.0, offset: DVec2::ZERO, reference: false });
+        top.solve_dims(None);
+        let centre_x = |p: &Part, id: u32| match &p.feature(id).unwrap().kind {
+            FeatureKind::Sketch(s) => match s.shapes[0] {
+                Shape::Circle { cx, .. } => cx,
+                _ => f64::NAN,
+            },
+            _ => f64::NAN,
+        };
+        let s2 = p.add_feature(FeatureKind::Sketch(top));
+        assert!((centre_x(&p, s2) - 15.0).abs() < 1e-9, "the circle moved, not the locked reference: {}", centre_x(&p, s2));
+        // widen the first sketch: the reference and the circle tied to it follow
+        if let FeatureKind::Sketch(s) = &mut p.feature_mut(s1).unwrap().kind {
+            s.shapes[0] = Shape::Rect { cx: 0.0, cy: 0.0, w: 60.0, h: 30.0, r: 0.0 };
+        }
+        p.touch_id(s1);
+        assert!((centre_x(&p, s2) - 25.0).abs() < 1e-9, "{}", centre_x(&p, s2));
     }
 }

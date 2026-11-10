@@ -280,7 +280,7 @@ impl Sketch {
         }
         let dn = delta.normalize();
         for f in 0..self.shapes.len() {
-            if visited.contains(&f) {
+            if visited.contains(&f) || self.is_ext(f) {
                 continue;
             }
             let ends = match self.shapes[f].endpoints() {
@@ -323,7 +323,8 @@ impl Sketch {
     /// left out of the count.
     pub fn fixed_state(&self, skip: Option<usize>) -> (HashSet<usize>, Vec<DVec2>) {
         let n = self.shapes.len();
-        let mut fixed: HashSet<usize> = HashSet::new();
+        // reference elements from other sketches are locked
+        let mut fixed: HashSet<usize> = (0..n).filter(|i| self.is_ext(*i)).collect();
         let mut orient: HashSet<usize> = HashSet::new();
         loop {
             let mut pts: Vec<DVec2> = vec![DVec2::ZERO];
@@ -494,6 +495,10 @@ impl Sketch {
             return;
         }
         let i = d.a.elem().unwrap_or(usize::MAX);
+        // a single-element dimension on a locked reference element cannot drive it
+        if d.b.is_none() && self.is_ext(i) {
+            return;
+        }
         match d.kind {
             DimKind::Length => match self.shapes[i].clone() {
                 Shape::Line { x1, y1, x2, y2 } | Shape::Axis { x1, y1, x2, y2 } => {
@@ -641,7 +646,7 @@ impl Sketch {
                     Some(b) => b,
                     None => continue,
                 };
-                let held = |r: &GRef| r.fixed() || r.elem().map_or(false, |e| set.contains(&e));
+                let held = |r: &GRef| self.locked(r) || r.elem().map_or(false, |e| set.contains(&e));
                 let (fa, fb) = (held(&d.a), held(&b));
                 if fa && !fb {
                     if let Some(e) = b.elem() {
@@ -662,18 +667,23 @@ impl Sketch {
 
     /// Which side of a two-item dimension moves: the one not held by other dimensions
     /// (the second item when both are free). Axes and the origin never move.
+    /// Axes, the origin and reference elements from other sketches never move.
+    pub fn locked(&self, r: &GRef) -> bool {
+        r.fixed() || r.elem().map_or(false, |e| self.is_ext(e))
+    }
+
     fn pick_mover(&self, di: usize, a: GRef, b: GRef) -> Option<(GRef, GRef)> {
         let anchored = self.held_for(di);
-        let held = |r: &GRef| r.fixed() || r.elem().map_or(false, |e| anchored.contains(&e));
+        let held = |r: &GRef| self.locked(r) || r.elem().map_or(false, |e| anchored.contains(&e));
         let same_elem = a.elem().is_some() && a.elem() == b.elem();
-        if !held(&b) || same_elem && !b.fixed() {
+        if !held(&b) || same_elem && !self.locked(&b) {
             Some((b, a))
         } else if !held(&a) {
             Some((a, b))
-        } else if !b.fixed() {
+        } else if !self.locked(&b) {
             // both are held: try the second anyway (the solver reports it if it cannot hold)
             Some((b, a))
-        } else if !a.fixed() {
+        } else if !self.locked(&a) {
             Some((a, b))
         } else {
             None

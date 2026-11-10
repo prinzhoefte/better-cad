@@ -1633,7 +1633,7 @@ impl App {
             let step = match (tool, &first) {
                 (SkTool::MeasureItem, _) => "Click an element or a point.".to_string(),
                 (_, None) => "Click the first item (point, element or axis).".to_string(),
-                (_, Some(f)) => format!("First: {}.  Click the second item.", self.sketch_data().map(|d| item_name(d, f)).unwrap_or_default()),
+                (_, Some(f)) => format!("First: {}.  Click the second item.", self.sketch_with_refs().map(|d| item_name(&d.0, f)).unwrap_or_default()),
             };
             // wrap the hint onto two lines when it is too wide
             let (l1, l2) = match step.split_once(".  ") {
@@ -1695,11 +1695,11 @@ impl App {
             return;
         }
         let idx = sel[0];
-        let (shape, constr) = match self.sketch_data() {
-            Some(d) if idx < d.shapes.len() => (d.shapes[idx].clone(), d.is_construction(idx)),
+        let (shape, constr, ext) = match self.sketch_data() {
+            Some(d) if idx < d.shapes.len() => (d.shapes[idx].clone(), d.is_construction(idx), d.is_ext(idx)),
             _ => return,
         };
-        let title = format!("{}{}", shape.kind_name(), if constr { " (construction)" } else { "" });
+        let title = format!("{}{}", shape.kind_name(), if ext { " (reference, locked)" } else if constr { " (construction)" } else { "" });
         let fields = shape.fields();
         let nfields = fields.len().min(24);
         let h = 24.0 + 16.0 + nfields as f32 * 30.0 + 46.0;
@@ -1727,6 +1727,10 @@ impl App {
             if let Some(s) = self.sketch.as_mut() {
                 s.sel.clear();
             }
+        }
+        if ext && change.is_some() {
+            self.err("A reference element follows the earlier sketch it comes from; change it there.");
+            return;
         }
         if let Some((fi, val)) = change {
             let mut ns = shape.clone();
@@ -2215,6 +2219,8 @@ impl App {
             "  Sketcher: Profile / Line draw connected lines; ends snap together (red = open).",
             "  Points snap to points, lines and in line with other points (dashed guides);",
             "  G or the dot-grid button switches snapping to the grid on and off.",
+            "  Earlier sketches show faintly: snap, measure and constrain to them. A picked",
+            "  edge becomes a locked yellow reference that follows its sketch when it changes.",
             "  Corner, Chamfer, Quick Trim and Mirror edit lines; Construction makes helpers.",
             "  Measure Between / Measure Item: distances, angles, lengths, radii and areas.",
             "  Constraint: dimensions that drive the shape; drag them, double-click to edit.",
