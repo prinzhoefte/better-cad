@@ -21,7 +21,7 @@ use ui::{sh, sw, Input};
 fn window_conf() -> macroquad::conf::Conf {
     macroquad::conf::Conf {
         miniquad_conf: miniquad::conf::Conf {
-            window_title: "PartForge - part and assembly design".to_owned(),
+            window_title: "BetterCAD - part and assembly design".to_owned(),
             window_width: 1440,
             window_height: 900,
             high_dpi: false,
@@ -575,7 +575,7 @@ async fn main() {
     let mut app = App::new();
     // open a document given on the command line (e.g. a double-clicked file)
     let args: Vec<String> = std::env::args().collect();
-    if let Some(f) = args.iter().skip(1).find(|a| !a.starts_with("--") && (a.ends_with(".pfpart") || a.ends_with(".pfasm") || a.ends_with(".stl") || a.ends_with(".obj"))) {
+    if let Some(f) = args.iter().skip(1).find(|a| !a.starts_with("--") && (a.ends_with(".bcpart") || a.ends_with(".bcasm") || a.ends_with(".stl") || a.ends_with(".obj"))) {
         if f.ends_with(".stl") || f.ends_with(".obj") {
             app.file_chosen(Purpose::ImportMesh, f.clone());
         } else {

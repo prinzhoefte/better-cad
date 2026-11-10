@@ -91,20 +91,38 @@ pub struct Ui {
     pending_commit: Option<String>,
 }
 
+// The interface font: Noto Sans (SIL Open Font License, see assets/fonts/OFL.txt), built into
+// the program so it looks the same everywhere. It is much easier to read than macroquad's
+// built-in pixel font.
+static UI_FONT_DATA: &[u8] = include_bytes!("../assets/fonts/NotoSans.ttf");
+
+thread_local! {
+    // Leaked on purpose: the font lives as long as the program, and dropping it at exit would
+    // free its texture after the graphics context is gone, which crashes.
+    static UI_FONT: Option<&'static Font> =
+        load_ttf_font_from_bytes(UI_FONT_DATA).ok().map(|f| &*Box::leak(Box::new(f)));
+}
+
+fn with_font<R>(f: impl FnOnce(Option<&Font>) -> R) -> R {
+    UI_FONT.with(|font| f(*font))
+}
+
 pub fn text_w(s: &str, size: u16) -> f32 {
-    measure_text(s, None, size, 1.0).width
+    with_font(|font| measure_text(s, font, size, 1.0).width)
 }
 
 pub fn text(s: &str, x: f32, y: f32, size: u16, c: Color) {
     // render glyphs at the real pixel size so text stays sharp when the interface is scaled
     let (fs, sc, asp) = camera_font_scale(size as f32);
     let k = ui_scale();
-    draw_text_ex(
-        s,
-        (x * k).round() / k,
-        (y * k).round() / k,
-        TextParams { font_size: fs, font_scale: sc, font_scale_aspect: asp, color: c, ..Default::default() },
-    );
+    with_font(|font| {
+        draw_text_ex(
+            s,
+            (x * k).round() / k,
+            (y * k).round() / k,
+            TextParams { font, font_size: fs, font_scale: sc, font_scale_aspect: asp, color: c, ..Default::default() },
+        );
+    });
 }
 
 // ---------------------------------------------------------------- interface scaling
@@ -140,7 +158,7 @@ fn settings_path() -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
         .or_else(|| std::env::var_os("APPDATA").map(std::path::PathBuf::from))?;
-    Some(base.join("partforge").join("settings.json"))
+    Some(base.join("bettercad").join("settings.json"))
 }
 
 /// Loads the saved interface size (100 % when there is none).

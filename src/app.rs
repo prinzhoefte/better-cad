@@ -2112,16 +2112,16 @@ impl App {
 
     pub fn open_file_dialog(&mut self, purpose: Purpose) {
         let exts: Vec<&'static str> = match purpose {
-            Purpose::OpenDoc => vec!["pfpart", "pfasm"],
+            Purpose::OpenDoc => vec!["bcpart", "bcasm"],
             Purpose::SaveDoc => match self.doc {
-                Doc::Part(_) => vec!["pfpart"],
-                Doc::Product(_) => vec!["pfasm"],
+                Doc::Part(_) => vec!["bcpart"],
+                Doc::Product(_) => vec!["bcasm"],
             },
             Purpose::ExportStl | Purpose::ExportStlSelected => vec!["stl"],
             Purpose::ExportObj => vec!["obj"],
             Purpose::ImportMesh | Purpose::InsertMesh => vec!["stl", "obj"],
-            Purpose::InsertPart => vec!["pfpart"],
-            Purpose::SavePartOfComp => vec!["pfpart"],
+            Purpose::InsertPart => vec!["bcpart"],
+            Purpose::SavePartOfComp => vec!["bcpart"],
         };
         let base = self.doc_name();
         let name = match purpose {
@@ -2263,7 +2263,7 @@ impl App {
                     self.say(&format!("Inserted {}.", path));
                     self.fit_all();
                 }
-                Ok(Doc::Product(_)) => self.err("That file is an assembly; pick a part (.pfpart) file."),
+                Ok(Doc::Product(_)) => self.err("That file is an assembly; pick a part (.bcpart) file."),
                 Err(e) => self.err(&format!("Could not open: {}", e)),
             },
         }

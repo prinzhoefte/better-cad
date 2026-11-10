@@ -1262,7 +1262,7 @@ fn ray_box(o: DVec3, d: DVec3, b: &Aabb) -> bool {
 pub fn write_stl(path: &str, tris: &[[DVec3; 3]]) -> std::io::Result<()> {
     let mut buf: Vec<u8> = Vec::with_capacity(84 + tris.len() * 50);
     let mut header = [0u8; 80];
-    let h = b"PartForge binary STL, units: millimetres";
+    let h = b"BetterCAD binary STL, units: millimetres";
     header[..h.len()].copy_from_slice(h);
     buf.extend_from_slice(&header);
     buf.extend_from_slice(&(tris.len() as u32).to_le_bytes());
@@ -1299,7 +1299,7 @@ pub fn write_obj(path: &str, tris: &[[DVec3; 3]]) -> std::io::Result<()> {
         }
         fs.push_str(&format!("f {} {} {}\n", ids[0], ids[1], ids[2]));
     }
-    std::fs::write(path, format!("# PartForge OBJ export (millimetres)\no model\n{}{}", vs, fs))
+    std::fs::write(path, format!("# BetterCAD OBJ export (millimetres)\no model\n{}{}", vs, fs))
 }
 
 pub fn read_stl(bytes: &[u8]) -> Result<Vec<[DVec3; 3]>, String> {

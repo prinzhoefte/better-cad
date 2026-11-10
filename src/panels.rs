@@ -88,7 +88,7 @@ impl App {
             }
             x += r.w + 2.0;
         }
-        let title = format!("PartForge - {}{}", self.doc_name(), if self.dirty { " *" } else { "" });
+        let title = format!("BetterCAD - {}{}", self.doc_name(), if self.dirty { " *" } else { "" });
         text(&title, x + 24.0, 18.0, 17, C_DIM);
         let wb = self.workbench();
         let tw = text_w(wb, 17);
@@ -381,7 +381,7 @@ impl App {
                 "Product Structure",
                 vec![
                     ("as_newpart", "New Part", "Create a new part in the assembly and edit it"),
-                    ("as_insert", "Existing Component", "Insert a saved part file (.pfpart)"),
+                    ("as_insert", "Existing Component", "Insert a saved part file (.bcpart)"),
                     ("as_mesh", "Insert Mesh", "Insert an STL or OBJ file as a component"),
                     ("as_edit", "Edit Part", "Edit the selected component's part (double-click works too)"),
                     ("as_dup", "Duplicate", "Copy the selected component"),
@@ -2036,7 +2036,7 @@ impl App {
             "  together (click a face on the part to move first). Fix anchors a part.",
             "",
             "FILES",
-            "  Save keeps parts (.pfpart) and assemblies (.pfasm) fully editable.",
+            "  Save keeps parts (.bcpart) and assemblies (.bcasm) fully editable.",
             "  Export STL for 3D printers (millimetres), OBJ for game engines.",
             "  Import STL/OBJ brings meshes in (e.g. parts exported from other CAD).",
             "",

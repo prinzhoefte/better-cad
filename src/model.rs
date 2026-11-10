@@ -1051,7 +1051,7 @@ pub fn save_doc(doc: &Doc, path: &str) -> Result<(), String> {
 
 pub fn load_doc(path: &str) -> Result<Doc, String> {
     let s = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    let mut d: Doc = serde_json::from_str(&s).map_err(|e| format!("not a PartForge file ({})", e))?;
+    let mut d: Doc = serde_json::from_str(&s).map_err(|e| format!("not a BetterCAD file ({})", e))?;
     match &mut d {
         Doc::Part(p) => p.touch(0),
         Doc::Product(pr) => {
@@ -1159,7 +1159,7 @@ mod tests {
         assert!(mq.volume() < 100000.0 - 30.0 * 9.0 * std::f64::consts::PI * 10.0);
         // save and reload
         let doc = Doc::Part(q.clone());
-        let path = std::env::temp_dir().join("pf_test.pfpart");
+        let path = std::env::temp_dir().join("bc_test.bcpart");
         save_doc(&doc, path.to_str().unwrap()).unwrap();
         match load_doc(path.to_str().unwrap()).unwrap() {
             Doc::Part(mut r) => assert!((r.mesh().volume() - mq.volume()).abs() < 1e-3),
