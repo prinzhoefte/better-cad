@@ -41,6 +41,24 @@ impl App {
         if let Dialog::Help = self.dialog {
             self.draw_help();
         }
+        if let Dialog::About = self.dialog {
+            self.draw_text_dialog(
+                "About BetterCAD",
+                &[
+                    "BetterCAD",
+                    concat!("  Version ", env!("CARGO_PKG_VERSION")),
+                    "",
+                    "  A free, open-source part and assembly modeller with a classic CAD workflow:",
+                    "  Sketcher, Part Design and Assembly Design.",
+                    "",
+                    "  Parts (.bcpart) and assemblies (.bcasm) stay fully editable;",
+                    "  STL and OBJ go to 3D printers and game engines.",
+                    "",
+                    "  Source and issues: github.com/prinzhoefte/better-cad",
+                    "  Built with Rust, macroquad and glam. Font: Noto Sans (SIL Open Font License).",
+                ],
+            );
+        }
         if let Dialog::Options = self.dialog {
             self.draw_options();
         }
@@ -68,7 +86,7 @@ impl App {
         self.ui.block(bar);
         draw_rectangle(0.0, 0.0, w, MENU_H, C_PANEL_DARK);
         draw_line(0.0, MENU_H, w, MENU_H, 1.0, C_BORDER);
-        let menus = ["Start", "File", "Edit", "View", "Insert", "Tools", "Help"];
+        let menus = ["Start", "File", "Edit", "View", "Insert", "Tools", "Help", "About"];
         let mut x = 6.0;
         let mut xs = vec![];
         for (i, m) in menus.iter().enumerate() {
@@ -80,7 +98,13 @@ impl App {
                 draw_rectangle(r.x, r.y, r.w, r.h, if open { C_ACTIVE } else { C_HOT });
             }
             text(m, r.x + 8.0, r.y + 14.0, 15, C_TEXT);
-            if self.ui.clicked(r) {
+            if *m == "About" {
+                // nothing to choose from: it opens straight away
+                if self.ui.clicked(r) {
+                    self.menu_open = None;
+                    self.dialog = Dialog::About;
+                }
+            } else if self.ui.clicked(r) {
                 self.menu_open = if open { None } else { Some(i) };
                 self.ctx_menu = None;
             } else if self.menu_open.is_some() && self.ui.hover(r) {
@@ -2248,11 +2272,16 @@ impl App {
             "      Ctrl + / Ctrl - / Ctrl 0: interface size (also Tools > Options, e.g. for 4K).",
             "Number fields accept maths and units: 20*3, 1.5in, 2cm.",
         ];
+        self.draw_text_dialog("Controls and Tips", &lines);
+    }
+
+    /// A window of text with a Close button; lines that are not indented are headings.
+    fn draw_text_dialog(&mut self, title: &str, lines: &[&str]) {
         let w = 640.0;
         let h = lines.len() as f32 * 19.0 + 80.0;
         let r = Rect::new((sw() - w) / 2.0, (sh() - h) / 2.0, w, h);
         self.ui.block(Rect::new(0.0, 0.0, sw(), sh()));
-        self.ui.panel(r, Some("Controls and Tips"));
+        self.ui.panel(r, Some(title));
         for (i, l) in lines.iter().enumerate() {
             let bold = !l.starts_with(' ') && !l.is_empty();
             text(l, r.x + 14.0, r.y + 46.0 + i as f32 * 19.0, 16, if bold { C_TITLE } else { C_TEXT });

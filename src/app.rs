@@ -52,6 +52,7 @@ pub enum Dialog {
     Constraint(usize),
     File(FileDialog),
     Help,
+    About,
     Options,
     /// "Constraint Definition" of a sketch dimension
     Dim(usize),
@@ -368,7 +369,7 @@ impl App {
         self.draw_ui();
 
         // viewport interaction
-        let modal = matches!(self.dialog, Dialog::File(_) | Dialog::Help | Dialog::Options) || self.menu_open.is_some() || self.ctx_menu.is_some();
+        let modal = matches!(self.dialog, Dialog::File(_) | Dialog::Help | Dialog::About | Dialog::Options) || self.menu_open.is_some() || self.ctx_menu.is_some();
         let over = self.ui.over_ui();
         if !modal {
             self.viewport_input(over);
@@ -2095,7 +2096,7 @@ impl App {
             if self.menu_open.is_some() || self.ctx_menu.is_some() {
                 self.menu_open = None;
                 self.ctx_menu = None;
-            } else if matches!(self.dialog, Dialog::Help | Dialog::Options | Dialog::Appearance(_)) {
+            } else if matches!(self.dialog, Dialog::Help | Dialog::About | Dialog::Options | Dialog::Appearance(_)) {
                 self.dialog = Dialog::None;
             } else {
                 self.cancel();
