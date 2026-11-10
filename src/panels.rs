@@ -12,7 +12,7 @@ use crate::view::quat_from_back_up;
 use glam::{DQuat, EulerRot};
 use macroquad::prelude::*;
 
-pub const MENU_H: f32 = 26.0;
+pub const MENU_H: f32 = 22.0;
 pub const STATUS_H: f32 = 24.0;
 pub const TOOLBAR_W: f32 = 152.0;
 pub const DIALOG_W: f32 = 320.0;
@@ -72,14 +72,14 @@ impl App {
         let mut x = 6.0;
         let mut xs = vec![];
         for (i, m) in menus.iter().enumerate() {
-            let r = Rect::new(x, 2.0, text_w(m, 17) + 18.0, MENU_H - 4.0);
+            let r = Rect::new(x, 2.0, text_w(m, 15) + 16.0, MENU_H - 4.0);
             xs.push(x);
             self.ui.reg(&format!("menu_{}", m.to_lowercase()), r);
             let open = self.menu_open == Some(i);
             if open || self.ui.hover(r) {
                 draw_rectangle(r.x, r.y, r.w, r.h, if open { C_ACTIVE } else { C_HOT });
             }
-            text(m, r.x + 9.0, r.y + 16.0, 17, C_TEXT);
+            text(m, r.x + 8.0, r.y + 14.0, 15, C_TEXT);
             if self.ui.clicked(r) {
                 self.menu_open = if open { None } else { Some(i) };
                 self.ctx_menu = None;
@@ -89,11 +89,11 @@ impl App {
             x += r.w + 2.0;
         }
         let title = format!("BetterCAD - {}{}", self.doc_name(), if self.dirty { " *" } else { "" });
-        text(&title, x + 24.0, 18.0, 17, C_DIM);
+        text(&title, x + 24.0, 16.0, 15, C_DIM);
         let wb = self.workbench();
-        let tw = text_w(wb, 17);
+        let tw = text_w(wb, 15);
         draw_rectangle(w - tw - 22.0, 3.0, tw + 16.0, MENU_H - 6.0, C_TITLE);
-        text(wb, w - tw - 14.0, 18.0, 17, WHITE);
+        text(wb, w - tw - 14.0, 16.0, 15, WHITE);
 
         if let Some(mi) = self.menu_open {
             let in_asm = self.product().is_some();

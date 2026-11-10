@@ -245,6 +245,45 @@ impl SelfTest {
                 a.do_undo();
                 a.do_undo();
             }),
+            // dragging a line next to another one: its ends line up with the other line's ends
+            // (CATIA-like alignment), although the lines never touch
+            ClickId("sk_line"),
+            ClickSketch(-60.0, 50.0),
+            ClickSketch(-40.0, 50.0),
+            ClickId("sk_line"),
+            ClickSketch(-57.0, 44.0),
+            ClickSketch(-37.0, 44.0),
+            ClickId("sk_select"),
+            // grid off, so only the alignment can put the ends exactly in line
+            Call(|a| a.sketch.as_mut().unwrap().snap = false),
+            Drag(
+                |a| {
+                    let f = a.sketch_data()?.frame;
+                    let px = a.sketch_px();
+                    let m = a.part_model();
+                    let at = |u: f64, v: f64| a.view.to_screen(m.transform_point3(f.to3(DVec2::new(u, v), 0.0)));
+                    // grab the middle, let go with the left end 2 px right of x = -60
+                    let (s, e) = (at(-47.0, 44.0)?, at(-50.0 + px * 2.0, 46.0)?);
+                    Some((s, e - s))
+                },
+                10,
+            ),
+            Check("align ends", |a| {
+                let s = a.sketch_data().and_then(|d| d.shapes.last().cloned());
+                match s {
+                    Some(Shape::Line { x1, x2, .. }) => {
+                        let (lo, hi) = (x1.min(x2), x1.max(x2));
+                        ((lo + 60.0).abs() < 1e-9 && (hi + 40.0).abs() < 1e-9, format!("dragged line now spans x {} .. {} (the other line spans -60 .. -40)", fmt(lo), fmt(hi)))
+                    }
+                    _ => (false, "no line was drawn".into()),
+                }
+            }),
+            Call(|a| {
+                a.sketch.as_mut().unwrap().snap = true;
+                a.do_undo();
+                a.do_undo();
+                a.do_undo();
+            }),
             ClickId("sk_exit"),
             Wait(40),
             ClickId("tb_pad"),

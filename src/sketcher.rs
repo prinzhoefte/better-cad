@@ -105,6 +105,8 @@ pub struct SketchEdit {
     pub sel_dim: Option<usize>,
     /// where each dimension's text was drawn (screen), for clicking and dragging it
     pub dim_rects: Vec<(usize, Rect)>,
+    /// snap guides: (point of another element, the dragged / drawn point lined up with it)
+    pub guides: Vec<(DVec2, DVec2)>,
 }
 
 pub fn preview(tool: SkTool, pts: &[DVec2], c: DVec2) -> Vec<Shape> {
@@ -213,7 +215,7 @@ impl App {
         }
     }
 
-    fn sketch_px(&self) -> f64 {
+    pub fn sketch_px(&self) -> f64 {
         self.sketch_frame_world().map(|f| self.view.px_size(f.o.as_vec3()) as f64).unwrap_or(1.0)
     }
 
@@ -276,47 +278,89 @@ impl App {
         sk.raw = raw;
         sk.cursor_ok = true;
 
-        // --- snapping: end / centre / middle points and intersections first, then any point
-        //     on a line, circle or arc, then horizontal / vertical, then the grid
+        // --- snapping. Every point of what is drawn or dragged (a "mover") can snap, not only
+        //     the cursor: onto end / centre / middle points and intersections, then onto a line,
+        //     circle or arc, then (x and y on their own) in line with the points of other
+        //     elements, shown by dashed guides like classic CAD sketchers, then the grid.
         let mut cur = raw;
         sk.snapped_to_point = false;
         sk.snap_kind = None;
         sk.hv = None;
-        let dragging_point = match &sk.drag {
-            Some(SkDrag::Point { p0, .. }) => Some(*p0),
-            _ => None,
+        sk.guides.clear();
+        // while dragging, snap to the sketch as it was when the drag began, so moved elements
+        // never snap to themselves
+        let base: Vec<Shape> = match &sk.drag {
+            Some(SkDrag::Shapes { orig, .. }) | Some(SkDrag::Point { orig, .. }) => orig.clone(),
+            _ => data.shapes.clone(),
         };
-        // elements the cursor may snap to (not the ones being dragged)
-        let usable: Vec<usize> = (0..data.shapes.len())
+        // movers: (position at the raw cursor, how it follows the cursor on x / y: 1, -1 or 0)
+        // the first mover is the cursor itself, except while dragging whole elements
+        let mut movers: Vec<(DVec2, DVec2)> = vec![(raw, DVec2::ONE)];
+        let cursor_moves = !matches!(sk.drag, Some(SkDrag::Shapes { .. }));
+        // where the movers started; nothing snaps to those
+        let mut left: Vec<DVec2> = vec![];
+        match &sk.drag {
+            Some(SkDrag::Shapes { start, orig, .. }) => {
+                let pts: Vec<DVec2> = sk.sel.iter().filter_map(|i| orig.get(*i)).flat_map(|s| s.key_points()).collect();
+                movers = pts.iter().map(|p| (*p + raw - *start, DVec2::ONE)).collect();
+                left = pts;
+            }
+            Some(SkDrag::Point { p0, .. }) => left = vec![*p0],
+            _ if !sk.pts.is_empty() => {
+                // key points of the shape being drawn that move one to one with the cursor
+                let e = px * 0.5;
+                let kp_at = |c: DVec2| preview(sk.tool, &sk.pts, c).iter().flat_map(|s| s.key_points()).collect::<Vec<_>>();
+                let (k0, kx, ky) = (kp_at(raw), kp_at(raw + DVec2::X * e), kp_at(raw + DVec2::Y * e));
+                if k0.len() == kx.len() && k0.len() == ky.len() {
+                    let one = |main: f64, cross: f64| if (main.abs() - 1.0).abs() < 1e-6 && cross.abs() < 1e-6 { main.signum() } else { 0.0 };
+                    for i in 0..k0.len() {
+                        let (dx, dy) = ((kx[i] - k0[i]) / e, (ky[i] - k0[i]) / e);
+                        let s = DVec2::new(one(dx.x, dy.x), one(dy.y, dx.y));
+                        if s != DVec2::ZERO {
+                            movers.push((k0[i], s));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        let moving = |s: &Shape| s.handle_points().iter().chain(s.key_points().iter()).any(|h| left.iter().any(|q| (*h - *q).length() < JOIN_TOL));
+        // elements the movers may snap to (not the ones being dragged)
+        let usable: Vec<usize> = (0..base.len())
             .filter(|i| {
                 let moving_shape = matches!(sk.drag, Some(SkDrag::Shapes { .. })) && sk.sel.contains(i);
-                let moving_point = dragging_point.map_or(false, |q| data.shapes[*i].handle_points().iter().any(|h| (*h - q).length() < JOIN_TOL));
+                let moving_point = matches!(sk.drag, Some(SkDrag::Point { .. })) && moving(&base[*i]);
                 !moving_shape && !moving_point
             })
             .collect();
         let mut kp: Vec<(DVec2, &'static str)> = vec![(DVec2::ZERO, "origin")];
         for &i in &usable {
-            kp.extend(data.shapes[i].key_points().into_iter().map(|p| (p, "point")));
+            kp.extend(base[i].key_points().into_iter().map(|p| (p, "point")));
         }
         kp.extend(sk.pts.iter().map(|p| (*p, "point")));
         // intersections of the elements right under the cursor
-        let near: Vec<usize> = usable.iter().cloned().filter(|i| data.shapes[*i].distance(raw) < px * 10.0).collect();
+        let near: Vec<usize> = usable.iter().cloned().filter(|i| base[*i].distance(raw) < px * 10.0).collect();
         for x in 0..near.len() {
             for y in (x + 1)..near.len() {
-                kp.extend(intersections(&data.shapes[near[x]], &data.shapes[near[y]]).into_iter().map(|p| (p, "intersection")));
+                kp.extend(intersections(&base[near[x]], &base[near[y]]).into_iter().map(|p| (p, "intersection")));
             }
         }
+        kp.retain(|(p, _)| !left.iter().any(|q| (*p - *q).length() < JOIN_TOL));
         let mut best = px * 10.0;
-        for (p, kind) in kp {
-            if dragging_point.map_or(false, |q| (q - p).length() < JOIN_TOL) {
+        for (k, (m, s)) in movers.iter().enumerate() {
+            if s.x == 0.0 || s.y == 0.0 {
                 continue;
             }
-            let dd = (p - raw).length();
-            if dd < best {
-                best = dd;
-                cur = p;
-                sk.snapped_to_point = true;
-                sk.snap_kind = Some(kind);
+            for (p, kind) in &kp {
+                let dd = (*p - *m).length();
+                if dd < best {
+                    best = dd;
+                    cur = raw + (*p - *m) * *s;
+                    sk.snapped_to_point = true;
+                    sk.snap_kind = Some(kind);
+                    // the cursor shows its own snap; mark other movers' snaps
+                    sk.guides = if k == 0 && cursor_moves { vec![] } else { vec![(*p, *p)] };
+                }
             }
         }
         let last = if matches!(sk.tool, SkTool::Line | SkTool::Profile | SkTool::Axis) { sk.pts.last().copied() } else { None };
@@ -332,41 +376,88 @@ impl App {
             }
         });
         if !sk.snapped_to_point {
-            // any point on the nearest line, circle, arc, ellipse or spline
-            let mut on: Option<(f64, usize)> = None;
-            for &i in &near {
-                let d = data.shapes[i].distance(raw);
-                if d < px * 8.0 && on.map_or(true, |o| d < o.0) {
-                    on = Some((d, i));
-                }
-            }
-            if let Some((_, i)) = on {
-                let shape = &data.shapes[i];
-                cur = shape.nearest_point(raw);
-                sk.snapped_to_point = true;
-                sk.snap_kind = Some("on curve");
-                // a horizontal / vertical line can end exactly where it meets the curve
-                if let (Some(l), Some((hv, dir))) = (last, hv_dir) {
-                    let hit = shape.line_hits(l, dir).into_iter().filter(|h| (*h - raw).length() < px * 12.0).min_by(|a, b| (*a - raw).length().partial_cmp(&(*b - raw).length()).unwrap());
-                    if let Some(h) = hit {
-                        cur = h;
-                        sk.hv = Some(hv);
+            // a mover onto the nearest line, circle, arc, ellipse or spline
+            let mut on: Option<(f64, DVec2, usize)> = None;
+            for (k, (m, s)) in movers.iter().enumerate() {
+                for &i in &usable {
+                    let shape = &base[i];
+                    let d = shape.distance(*m);
+                    if d >= px * 8.0 || on.map_or(false, |o| d >= o.0) {
+                        continue;
+                    }
+                    // a mover that follows the cursor on one axis only slides along that axis
+                    let q = if s.x != 0.0 && s.y != 0.0 {
+                        Some(shape.nearest_point(*m))
+                    } else {
+                        let dir = if s.x != 0.0 { DVec2::X } else { DVec2::Y };
+                        shape.line_hits(*m, dir).into_iter().filter(|h| (*h - *m).length() < px * 8.0).min_by(|a, b| (*a - *m).length().total_cmp(&(*b - *m).length()))
+                    };
+                    if let Some(q) = q {
+                        on = Some((d, raw + (q - *m) * *s, k));
+                        sk.guides = if k == 0 && cursor_moves { vec![] } else { vec![(q, q)] };
+                        // a horizontal / vertical line can end exactly where it meets the curve
+                        if let (0, true, Some(l), Some((hv, dir))) = (k, cursor_moves, last, hv_dir) {
+                            let hit = shape.line_hits(l, dir).into_iter().filter(|h| (*h - raw).length() < px * 12.0).min_by(|a, b| (*a - raw).length().total_cmp(&(*b - raw).length()));
+                            if let Some(h) = hit {
+                                on = Some((d, h, k));
+                                sk.hv = Some(hv);
+                            } else {
+                                sk.hv = None;
+                            }
+                        }
                     }
                 }
             }
+            if let Some((_, c, _)) = on {
+                cur = c;
+                sk.snapped_to_point = true;
+                sk.snap_kind = Some("on curve");
+            }
         }
         if !sk.snapped_to_point {
-            if sk.snap {
-                cur = (raw / sk.grid).round() * sk.grid;
-            }
+            let mut done = [false, false];
             if let (Some(l), Some((hv, _))) = (last, hv_dir) {
-                if hv == "H" {
-                    cur.y = l.y;
-                } else {
-                    cur.x = l.x;
-                }
+                let a = if hv == "H" { 1 } else { 0 };
+                cur[a] = l[a];
+                done[a] = true;
                 sk.hv = Some(hv);
             }
+            // in line with a point of another element (CATIA-like alignment)
+            let mut aligned = vec![];
+            for a in 0..2 {
+                if done[a] {
+                    continue;
+                }
+                let mut pick: Option<(f64, DVec2, usize)> = None;
+                for (k, (m, s)) in movers.iter().enumerate() {
+                    if s[a] == 0.0 {
+                        continue;
+                    }
+                    for (p, _) in &kp {
+                        let dd = (p[a] - m[a]).abs();
+                        // the nearer point wins a tie, so the guide stays short
+                        let tie = pick.map_or(false, |b| (dd - b.0).abs() < 1e-9 && (*p - *m).length() < (b.1 - movers[b.2].0).length());
+                        if dd < px * 6.0 && (pick.map_or(true, |b| dd < b.0 - 1e-9) || tie) {
+                            pick = Some((dd, *p, k));
+                        }
+                    }
+                }
+                if let Some((_, p, k)) = pick {
+                    let (m, s) = movers[k];
+                    cur[a] = raw[a] + (p[a] - m[a]) * s[a];
+                    done[a] = true;
+                    aligned.push((p, k));
+                }
+            }
+            if sk.snap {
+                for a in 0..2 {
+                    if !done[a] {
+                        cur[a] = (raw[a] / sk.grid).round() * sk.grid;
+                    }
+                }
+            }
+            // guides from the point aligned with to where the mover ends up
+            sk.guides = aligned.into_iter().map(|(p, k)| (p, movers[k].0 + (cur - raw) * movers[k].1)).collect();
         }
         sk.cursor = cur;
         let tool = sk.tool;
@@ -987,6 +1078,7 @@ impl App {
             cons_first: None,
             sel_dim: None,
             dim_rects: vec![],
+            guides: vec![],
         });
         self.sel = Sel::Feature(id);
         self.hover = None;
@@ -1268,6 +1360,17 @@ impl App {
                 let (lo, hi) = (a.min(b), a.max(b));
                 draw_rectangle(lo.x, lo.y, hi.x - lo.x, hi.y - lo.y, Color::new(0.4, 0.6, 1.0, 0.12));
                 draw_rectangle_lines(lo.x, lo.y, hi.x - lo.x, hi.y - lo.y, 1.0, Color::new(0.5, 0.7, 1.0, 0.9));
+            }
+        }
+        // snap guides
+        if sk.cursor_ok && !self.ui.over_ui() {
+            let gcol = Color::new(0.35, 0.75, 1.0, 0.9);
+            for (a, b) in &sk.guides {
+                if let (Some(sa), Some(sb)) = (to_s(*a), to_s(*b)) {
+                    dashed(sa, sb, 1.0, gcol, &mut 0.0, 6.0);
+                    draw_circle_lines(sa.x, sa.y, 4.0, 1.5, gcol);
+                    draw_circle_lines(sb.x, sb.y, 4.0, 1.5, gcol);
+                }
             }
         }
         // cursor
