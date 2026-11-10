@@ -456,6 +456,11 @@ impl SelfTest {
                 let ok = toolbar >= 10 && tree >= 3 && menus && status && !info.is_empty();
                 (ok, format!("menu bar, {} toolbar buttons, specification tree ({} rows), view toolbar and status bar ('{}') are drawn", toolbar, tree, info))
             }),
+            ClickId("menu_about"),
+            Wait(3),
+            Check("about", |a| (matches!(a.dialog, Dialog::About), format!("About in the menu bar opens the About window (version {})", env!("CARGO_PKG_VERSION")))),
+            ClickId("help_close"),
+            Wait(3),
         ];
         SelfTest { path, acts, i: 0, sub: 0, mouse: vec2(700.0, 450.0), results: vec![], done: false, drag: None, dbl: false }
     }
