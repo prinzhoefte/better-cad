@@ -96,29 +96,27 @@ pub fn find_edge(edges: &[SharpEdge], r: &EdgeRef) -> Option<usize> {
 
 /// The edge plus every edge that continues it smoothly (tangency propagation).
 pub fn edge_chain(edges: &[SharpEdge], start: usize) -> Vec<usize> {
-    let key = |p: DVec3| ((p.x * 1e4).round() as i64, (p.y * 1e4).round() as i64, (p.z * 1e4).round() as i64);
+    edge_chains(edges, &[start])
+}
+
+/// The edges and every edge that continues one of them smoothly.
+pub fn edge_chains(edges: &[SharpEdge], starts: &[usize]) -> Vec<usize> {
     let mut at: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
     for (i, e) in edges.iter().enumerate() {
-        at.entry(key(e.a)).or_default().push(i);
-        at.entry(key(e.b)).or_default().push(i);
+        at.entry(vkey(e.a)).or_default().push(i);
+        at.entry(vkey(e.b)).or_default().push(i);
     }
     let cos = 30f64.to_radians().cos();
-    let mut seen = BTreeSet::new();
-    seen.insert(start);
-    let mut stack = vec![start];
+    let mut seen: BTreeSet<usize> = starts.iter().copied().collect();
+    let mut stack = starts.to_vec();
     while let Some(i) = stack.pop() {
         let e = edges[i];
         let di = (e.b - e.a).normalize_or_zero();
         for p in [e.a, e.b] {
-            let cands: Vec<usize> = at.get(&key(p)).cloned().unwrap_or_default().into_iter().filter(|j| *j != i).collect();
-            for j in cands {
-                if seen.contains(&j) {
-                    continue;
-                }
+            for &j in &at[&vkey(p)] {
                 let f = edges[j];
                 let dj = (f.b - f.a).normalize_or_zero();
-                if di.dot(dj).abs() > cos && f.convex == e.convex {
-                    seen.insert(j);
+                if di.dot(dj).abs() > cos && f.convex == e.convex && seen.insert(j) {
                     stack.push(j);
                 }
             }
@@ -133,12 +131,8 @@ pub fn edge_ref(e: &SharpEdge) -> EdgeRef {
 
 /// Every edge segment the references select (with tangency propagation).
 pub fn selected_segments(edges: &[SharpEdge], refs: &[EdgeRef]) -> Result<Vec<usize>, String> {
-    let mut set = BTreeSet::new();
-    for r in refs {
-        let i = find_edge(edges, r).ok_or("an edge picked earlier no longer exists (pick it again)")?;
-        set.extend(edge_chain(edges, i));
-    }
-    Ok(set.into_iter().collect())
+    let starts = refs.iter().map(|r| find_edge(edges, r).ok_or("an edge picked earlier no longer exists (pick it again)")).collect::<Result<Vec<_>, _>>()?;
+    Ok(edge_chains(edges, &starts))
 }
 
 fn vkey(p: DVec3) -> (i64, i64, i64) {
@@ -492,13 +486,16 @@ struct Run {
     vids: Vec<u32>,
     /// face normals of each segment, consistently ordered along the run
     normals: Vec<(DVec3, DVec3)>,
+    /// a mesh edge lying on each segment
+    mesh_edges: Vec<(u32, u32)>,
     convex: bool,
     closed: bool,
 }
 
 impl Run {
-    fn new(edges: &[SharpEdge], run: &[(usize, bool)], closed: bool) -> Run {
-        let (mut pts, mut vids, mut normals) = (Vec::new(), Vec::new(), Vec::<(DVec3, DVec3)>::new());
+    /// Segments in line with each other (within `tol`) between the same two faces become one.
+    fn new(edges: &[SharpEdge], run: &[(usize, bool)], closed: bool, tol: f64) -> Run {
+        let (mut pts, mut vids, mut normals, mut mesh_edges) = (Vec::new(), Vec::new(), Vec::<(DVec3, DVec3)>::new(), Vec::new());
         for (k, &(i, rev)) in run.iter().enumerate() {
             let e = edges[i];
             let (a, b, ia, ib) = if rev { (e.b, e.a, e.ib, e.ia) } else { (e.a, e.b, e.ia, e.ib) };
@@ -515,12 +512,62 @@ impl Run {
                 }
             }
             normals.push((n1, n2));
+            mesh_edges.push((ia, ib));
         }
         if closed {
             pts.pop();
             vids.pop();
         }
-        Run { pts, vids, normals, convex: edges[run[0].0].convex, closed }
+        // the booleans leave straight edges in pieces: every extra point would be one more
+        // ring of the tool, and unevenly spaced ones make its rings cross
+        let n = pts.len();
+        let at = |k: usize| pts[k % n];
+        let same = |a: (DVec3, DVec3), b: (DVec3, DVec3)| a.0.dot(b.0) > 0.9999 && a.1.dot(b.1) > 0.9999;
+        let mut keep = vec![0];
+        for e in 2..=normals.len() {
+            let a = *keep.last().unwrap();
+            if !same(normals[a], normals[e - 1]) || (a + 1..e).any(|k| dist_point_seg3(at(k), at(a), at(e)) > tol) {
+                keep.push(e - 1);
+            }
+        }
+        let last = (!closed).then_some(n - 1);
+        Run {
+            pts: keep.iter().copied().chain(last).map(|k| pts[k]).collect(),
+            vids: keep.iter().copied().chain(last).map(|k| vids[k]).collect(),
+            normals: keep.iter().map(|k| normals[*k]).collect(),
+            mesh_edges: keep.iter().map(|k| mesh_edges[*k]).collect(),
+            convex: edges[run[0].0].convex,
+            closed,
+        }
+    }
+    fn seg_len(&self, k: usize) -> f64 {
+        (self.pts[(k + 1) % self.pts.len()] - self.pts[k]).length()
+    }
+    /// A segment much longer than the ones next to it: a straight stretch between rounded ones.
+    // ponytail: told by length alone, so a long chord between two short ones on an unevenly
+    // cut round edge counts as straight too; compare the turns at its ends if that shows
+    fn is_straight(&self, k: usize) -> bool {
+        let n = self.normals.len();
+        let next = [(k + n - 1) % n, (k + 1) % n].into_iter().filter(|j| self.closed || j.abs_diff(k) == 1);
+        next.into_iter().all(|j| self.seg_len(k) >= 4.0 * self.seg_len(j))
+    }
+    /// Direction of the run at point i: the plane across it there holds the tool's ring.
+    fn tangent(&self, i: usize) -> DVec3 {
+        let n = self.normals.len();
+        let before = if i > 0 { Some(i - 1) } else if self.closed { Some(n - 1) } else { None };
+        let after = (i < n).then_some(i);
+        match (before, after) {
+            (Some(b), Some(a)) => match (self.is_straight(b), self.is_straight(a)) {
+                // square to a straight stretch at both its ends, so its strips stay flat
+                (true, false) => self.seg_dir(b),
+                (false, true) => self.seg_dir(a),
+                // along the circle through the point and its neighbours: on a round edge
+                // the rings then all pass through its axis and never cross, however
+                // unevenly the points are spaced
+                _ => (self.seg_dir(b) * self.seg_len(a) + self.seg_dir(a) * self.seg_len(b)).normalize_or_zero(),
+            },
+            (b, a) => self.seg_dir(b.or(a).unwrap()),
+        }
     }
     fn seg_dir(&self, k: usize) -> DVec3 {
         (self.pts[(k + 1) % self.pts.len()] - self.pts[k]).normalize_or_zero()
@@ -547,10 +594,12 @@ impl Run {
                 self.pts.remove(0);
                 self.vids.remove(0);
                 self.normals.remove(0);
+                self.mesh_edges.remove(0);
             } else {
                 self.pts.pop();
                 self.vids.pop();
                 self.normals.pop();
+                self.mesh_edges.pop();
             }
         }
         b
@@ -672,11 +721,12 @@ fn ball_corner(v: DVec3, faces: [DVec3; 3], dirs: [DVec3; 3], size: f64, eps: f6
 /// two filleted edges meeting at a corner join like a picture frame, three convex ones get a
 /// ball-shaped corner, and a fillet ending at a convex corner runs on until the next face
 /// trims it.
-pub fn edge_tools(m: &Mesh, edges: &[SharpEdge], segs: &[usize], size: f64, chamfer: bool) -> (Vec<Solid>, Vec<Solid>) {
+pub fn edge_tools(m: &Mesh, edges: &[SharpEdge], segs: &[usize], size: f64, chamfer: bool) -> Result<(Vec<Solid>, Vec<Solid>), String> {
     let topo = Topo::new(m);
+    let what = if chamfer { "the length" } else { "the radius" };
     let eps = 0.02f64.min(size * 0.05).max(1e-3);
     let walk_len = size * 3.0 + 1.0;
-    let runs: Vec<Run> = edge_runs(edges, segs).iter().map(|(r, closed)| Run::new(edges, r, *closed)).collect();
+    let runs: Vec<Run> = edge_runs(edges, segs).iter().map(|(r, closed)| Run::new(edges, r, *closed, eps * 0.25)).collect();
     // sharp edges at each corner: how many, and whether all are convex
     let mut corner: HashMap<(i64, i64, i64), (usize, bool)> = HashMap::new();
     for e in edges {
@@ -778,24 +828,23 @@ pub fn edge_tools(m: &Mesh, edges: &[SharpEdge], segs: &[usize], size: f64, cham
         }
         let np = r.pts.len();
         let nseg = r.normals.len();
-        let mut rings = Vec::with_capacity(np);
+        let (mut rings, mut planes) = (Vec::with_capacity(np), Vec::with_capacity(np));
         for i in 0..np {
             // segments before and after this point
             let before = if i > 0 { Some(i - 1) } else if r.closed { Some(nseg - 1) } else { None };
             let after = if i < nseg { Some(i) } else { None };
-            let (mut n1, mut n2, mut t) = (DVec3::ZERO, DVec3::ZERO, DVec3::ZERO);
+            let (mut n1, mut n2) = (DVec3::ZERO, DVec3::ZERO);
             for k in [before, after].into_iter().flatten() {
                 n1 += r.normals[k].0;
                 n2 += r.normals[k].1;
-                t += r.seg_dir(k % np);
             }
-            let (n1, n2, t) = (n1.normalize_or_zero(), n2.normalize_or_zero(), t.normalize_or_zero());
+            let (n1, n2, t) = (n1.normalize_or_zero(), n2.normalize_or_zero(), r.tangent(i));
             let is_end = !r.closed && (i == 0 || i == np - 1);
             // trace the faces across the edge: at run ends across the middle of the end
             // segment (the end point itself is a corner of other faces)
             let (o, traced) = if is_end {
-                let k = if i == 0 { 0 } else { nseg - 1 };
-                match traces_at_segment(m, &topo, r.vids[k], r.vids[k + 1], walk_len) {
+                let (ia, ib) = r.mesh_edges[if i == 0 { 0 } else { nseg - 1 }];
+                match traces_at_segment(m, &topo, ia, ib, walk_len) {
                     Some((mid, tr)) => (mid, Some(tr)),
                     None => (r.pts[i], None),
                 }
@@ -807,8 +856,9 @@ pub fn edge_tools(m: &Mesh, edges: &[SharpEdge], segs: &[usize], size: f64, cham
                 .map(|tr| order_traces(tr, n1))
                 .and_then(|tr| section(o, t, &tr, r.convex, size, chamfer, eps))
                 .or_else(|| section(o, t, &flat(), r.convex, size, chamfer, eps));
-            let Some(sec) = sec else { break };
-            let mut p = r.pts[i];
+            let sec = sec.ok_or_else(|| format!("{what} does not fit between the faces along one of the edges"))?;
+            // where the ring is, and the plane it lies in (facing along the run)
+            let (mut p, mut across) = (r.pts[i], t);
             let ring: Vec<DVec3> = if is_end {
                 let u = r.beyond(i == 0);
                 match ends[if i == 0 { 0 } else { 1 }] {
@@ -820,54 +870,59 @@ pub fn edge_tools(m: &Mesh, edges: &[SharpEdge], segs: &[usize], size: f64, cham
                         p -= u * b;
                         sec.iter().map(|o| p + *o).collect()
                     }
-                    End::Mitre(mn) => sec
-                        .iter()
-                        .map(|o| {
-                            // exactly onto the plane: the other tool ends there too, so
-                            // together they cover the corner without overlapping faces
-                            p + *o + u * (-(*o).dot(mn) / u.dot(mn))
-                        })
-                        .collect(),
+                    End::Mitre(mn) => {
+                        across = if mn.dot(t) < 0.0 { -mn } else { mn };
+                        // exactly onto the plane: the other tool ends there too, so
+                        // together they cover the corner without overlapping faces
+                        sec.iter().map(|o| p + *o + u * (-(*o).dot(mn) / u.dot(mn))).collect()
+                    }
                 }
             } else {
                 sec.iter().map(|o| p + *o).collect()
             };
             rings.push(ring);
+            planes.push((p, across));
         }
-        if rings.len() != np || rings.len() < 2 {
+        // every ring has to lie before the next one. Along an edge that bends more tightly
+        // than the tool is wide (say a small rounding made earlier, which this edge runs
+        // into) they would cross, and the tool would fold over itself
+        let reach = |ring: &[DVec3], (p, n): (DVec3, DVec3)| ring.iter().map(|q| (*q - p).dot(n)).fold((f64::MAX, f64::MIN), |s, d| (s.0.min(d), s.1.max(d)));
+        for k in 0..nseg {
+            let j = (k + 1) % np;
+            if reach(&rings[k], planes[j]).1 > 1e-6 || reach(&rings[j], planes[k]).0 < -1e-6 {
+                return Err(format!("{what} is too large for a tightly curved edge (edges that continue the picked ones smoothly are included): make it smaller, or apply this before the rounding next to it"));
+            }
+        }
+        // a long or ring-shaped tool goes in stretches, each a solid of its own: a boolean
+        // only looks at the faces within its tool's bounding box, and the box of a tool
+        // running all around a part would hold the whole part
+        let limit = size * 12.0;
+        let extent = |rs: &[Vec<DVec3>]| {
+            let mut b = Aabb::empty();
+            rs.iter().flatten().for_each(|q| b.add(*q));
+            b.size().max_element()
+        };
+        let pieces = if r.convex { &mut cuts } else { &mut adds };
+        if extent(&rings) <= limit {
+            pieces.push(skin(&rings, r.closed)?);
             continue;
         }
-        if let Ok(piece) = skin(&rings, r.closed) {
-            if r.convex {
-                cuts.push(piece);
-            } else {
-                adds.push(piece);
+        if r.closed {
+            rings.push(rings[0].clone());
+        }
+        let mut from = 0;
+        for k in 1..rings.len() {
+            if k + 1 == rings.len() || extent(&rings[from..=k + 1]) > limit {
+                pieces.push(skin(&rings[from..=k], false)?);
+                from = k;
             }
         }
     }
-    (layers(cuts), layers(adds))
+    Ok((cuts, adds))
 }
 
-/// Groups tool pieces into layers of pieces that do not touch, each layer simply put
-/// together (they cannot intersect). Overlapping pieces go into separate layers to be applied
-/// one after the other: joining two tools first would have to sort out their coinciding faces
-/// (e.g. both lying on the same face of the part), which the boolean operations handle poorly.
-pub fn layers(pieces: Vec<Solid>) -> Vec<Solid> {
-    let mut out: Vec<(Solid, Vec<Aabb>)> = Vec::new();
-    for p in pieces {
-        let b = p.bbox();
-        match out.iter_mut().find(|(_, boxes)| !boxes.iter().any(|x| x.overlaps(&b))) {
-            Some((s, boxes)) => {
-                s.polys.extend(p.polys);
-                boxes.push(b);
-            }
-            None => out.push((p, vec![b])),
-        }
-    }
-    out.into_iter().map(|x| x.0).collect()
-}
-
-/// Applies edge tools to a body: removes the cut layers, then adds the added ones.
+/// Applies edge tools to a body: removes the cut pieces, then adds the added ones, one by
+/// one (each a small boolean near its own edge).
 pub fn apply_edge_tools(body: &Solid, cuts: &[Solid], adds: &[Solid]) -> Solid {
     let mut b = body.clone();
     for c in cuts {
@@ -977,6 +1032,16 @@ fn newell(p: &[DVec3]) -> DVec3 {
 /// (`closed` joins the last ring back to the first and needs no caps).
 fn skin(rings: &[Vec<DVec3>], closed: bool) -> Result<Solid, String> {
     let n = rings[0].len();
+    // where rings (all but) meet in a point, as at the pole of a ball-shaped corner, they
+    // share that point: no needles between nearly equal ones
+    let mut rings = rings.to_vec();
+    for k in 1..rings.len() {
+        for i in 0..n {
+            if (rings[k][i] - rings[k - 1][i]).length() < 1e-7 {
+                rings[k][i] = rings[k - 1][i];
+            }
+        }
+    }
     let mut polys = Vec::new();
     let r = rings.len();
     let segs = if closed { r } else { r - 1 };
@@ -984,8 +1049,19 @@ fn skin(rings: &[Vec<DVec3>], closed: bool) -> Result<Solid, String> {
         let (a, b) = (&rings[k], &rings[(k + 1) % r]);
         for i in 0..n {
             let j = (i + 1) % n;
-            polys.extend(Poly::new(vec![a[i], a[j], b[j]]));
-            polys.extend(Poly::new(vec![a[i], b[j], b[i]]));
+            let q = [a[i], a[j], b[j], b[i]];
+            // a flat strip stays one face: cut in two, the diagonal leaves a stray point on
+            // every face the strip runs into
+            let nrm = (q[1] - q[0]).cross(q[3] - q[0]);
+            let size = nrm.length().sqrt();
+            let flat = ((q[2] - q[0]).dot(nrm)).abs() < 1e-9 * size.powi(3);
+            let convex = (0..4).all(|k| (q[(k + 1) % 4] - q[k]).cross(q[(k + 2) % 4] - q[(k + 1) % 4]).dot(nrm) > 1e-12 * size.powi(4));
+            if flat && convex {
+                polys.extend(Poly::new(q.to_vec()));
+            } else {
+                polys.extend(Poly::new(vec![a[i], a[j], b[j]]));
+                polys.extend(Poly::new(vec![a[i], b[j], b[i]]));
+            }
         }
     }
     if !closed {
@@ -1110,13 +1186,13 @@ mod tests {
         let i = edges.iter().position(|e| (e.a.y - 10.0).abs() < 1e-9 && (e.a.z - 10.0).abs() < 1e-9 && (e.b.y - 10.0).abs() < 1e-9 && (e.b.z - 10.0).abs() < 1e-9).unwrap();
         let r = edge_ref(&edges[i]);
         let segs = selected_segments(&edges, &[r]).unwrap();
-        let (cut, add) = edge_tools(&m, &edges, &segs, 2.0, false);
+        let (cut, add) = edge_tools(&m, &edges, &segs, 2.0, false).unwrap();
         assert!(add.is_empty());
         let filleted = apply_edge_tools(&s, &cut, &add);
         let removed = 2000.0 - filleted.volume();
         let expect = (4.0 - std::f64::consts::PI) * 20.0; // (r² - πr²/4) · length
         assert!((removed - expect).abs() < 0.3, "{} vs {}", removed, expect);
-        let (cut, _) = edge_tools(&m, &edges, &segs, 2.0, true);
+        let (cut, _) = edge_tools(&m, &edges, &segs, 2.0, true).unwrap();
         let chamfered = apply_edge_tools(&s, &cut, &[]);
         assert!(((2000.0 - chamfered.volume()) - 40.0).abs() < 0.3, "{}", 2000.0 - chamfered.volume());
     }
@@ -1194,7 +1270,7 @@ mod perf {
             .collect();
         let t = Instant::now();
         let segs = selected_segments(&edges, &refs).unwrap();
-        let (cut, _) = edge_tools(&m, &edges, &segs, 1.0, false);
+        let (cut, _) = edge_tools(&m, &edges, &segs, 1.0, false).unwrap();
         println!("{} refs, {} segments, tool {} polys: {:?}", refs.len(), segs.len(), cut.iter().map(|c| c.polys.len()).sum::<usize>(), t.elapsed());
         let t = Instant::now();
         let r = apply_edge_tools(&body, &cut, &[]);
@@ -1217,7 +1293,7 @@ mod edge_lines {
         let edges = sharp_edges(&m);
         let i = edges.iter().position(|e| (e.a.y - 10.0).abs() < 1e-9 && (e.a.z - 10.0).abs() < 1e-9 && (e.b.y - 10.0).abs() < 1e-9 && (e.b.z - 10.0).abs() < 1e-9).unwrap();
         let segs = selected_segments(&edges, &[edge_ref(&edges[i])]).unwrap();
-        let (cut, _) = edge_tools(&m, &edges, &segs, 2.0, false);
+        let (cut, _) = edge_tools(&m, &edges, &segs, 2.0, false).unwrap();
         let r = Mesh::from_solid(&apply_edge_tools(&s, &cut, &[]));
         let mut map: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
         for (t, tri) in r.tris.iter().enumerate() {
@@ -1252,7 +1328,7 @@ mod rim_lines {
         let edges = sharp_edges(&m);
         let i = edges.iter().position(|e| e.a.z > 9.99 && e.b.z > 9.99).unwrap();
         let segs = selected_segments(&edges, &[edge_ref(&edges[i])]).unwrap();
-        let (cut, _) = edge_tools(&m, &edges, &segs, size, false);
+        let (cut, _) = edge_tools(&m, &edges, &segs, size, false).unwrap();
         let r = Mesh::from_solid(&apply_edge_tools(&body, &cut, &[]));
         let rr = |p: DVec3| (p.x * p.x + p.y * p.y).sqrt();
         let inside = |p: DVec3| rr(p) > radius - size + 0.05 && rr(p) < radius - 0.05 && p.z > 10.0 - size + 0.05 && p.z < 9.95;
@@ -1286,7 +1362,7 @@ mod curved_faces {
         let edges = sharp_edges(&m);
         let i = edges.iter().position(|e| pick(e)).expect("edge to fillet");
         let segs = selected_segments(&edges, &[edge_ref(&edges[i])]).unwrap();
-        let (cut, add) = edge_tools(&m, &edges, &segs, size, chamfer);
+        let (cut, add) = edge_tools(&m, &edges, &segs, size, chamfer).unwrap();
         let out = apply_edge_tools(&body, &cut, &add);
         let r = Mesh::from_solid(&out);
         // creases sharper than the facets of the round faces themselves (9° here)
@@ -1396,7 +1472,7 @@ mod corners {
         let (edges, refs) = pick_edges(&m, &|e| (e.a - corner).length() < 1e-6 || (e.b - corner).length() < 1e-6);
         assert_eq!(refs.len(), 3);
         let segs = selected_segments(&edges, &refs).unwrap();
-        let (cut, _) = edge_tools(&m, &edges, &segs, 4.0, false);
+        let (cut, _) = edge_tools(&m, &edges, &segs, 4.0, false).unwrap();
         let out = apply_edge_tools(&s, &cut, &[]);
         let r = Mesh::from_solid(&out);
         assert_eq!(open_edges(&r), 0);
@@ -1422,7 +1498,7 @@ mod corners {
         let (edges, refs) = pick_edges(&m, &|e| e.a.z > 9.99 && e.b.z > 9.99 && ((e.a.x > 29.99 && e.b.x > 29.99) || (e.a.y > 19.99 && e.b.y > 19.99)));
         assert_eq!(refs.len(), 2);
         let segs = selected_segments(&edges, &refs).unwrap();
-        let (cut, _) = edge_tools(&m, &edges, &segs, 3.0, false);
+        let (cut, _) = edge_tools(&m, &edges, &segs, 3.0, false).unwrap();
         let out = apply_edge_tools(&s, &cut, &[]);
         assert_eq!(open_edges(&Mesh::from_solid(&out)), 0);
         let pi = std::f64::consts::PI;
@@ -1446,7 +1522,7 @@ mod corners {
         let (edges, refs) = pick_edges(&m, &|e| e.a.z > 9.99 && e.b.z > 9.99 && (((e.a.y - 10.0).abs() < 1e-6 && (e.b.y - 10.0).abs() < 1e-6 && e.a.x > 9.99 && e.b.x > 9.99) || ((e.a.x - 10.0).abs() < 1e-6 && (e.b.x - 10.0).abs() < 1e-6 && e.a.y > 9.99 && e.b.y > 9.99)));
         assert!(refs.len() >= 2);
         let segs = selected_segments(&edges, &refs).unwrap();
-        let (cut, _) = edge_tools(&m, &edges, &segs, 3.0, false);
+        let (cut, _) = edge_tools(&m, &edges, &segs, 3.0, false).unwrap();
         let out = apply_edge_tools(&s, &cut, &[]);
         let r = Mesh::from_solid(&out);
         nearly_clean(&r);
@@ -1474,7 +1550,7 @@ mod corners {
         let (edges, refs) = pick_edges(&m, &|e| !e.convex && (e.a.y - 5.0).abs() < 1e-6 && (e.a.z - 5.0).abs() < 1e-6 && (e.b.y - 5.0).abs() < 1e-6);
         assert!(!refs.is_empty());
         let segs = selected_segments(&edges, &refs).unwrap();
-        let (cut, add) = edge_tools(&m, &edges, &segs, 4.0, false);
+        let (cut, add) = edge_tools(&m, &edges, &segs, 4.0, false).unwrap();
         assert!(cut.is_empty());
         let out = apply_edge_tools(&s, &cut, &add);
         nearly_clean(&Mesh::from_solid(&out));
@@ -1508,7 +1584,7 @@ mod watertight {
         let segs = selected_segments(&edges, &refs).unwrap();
         let mut removed = 0.0;
         for chamfer in [false, true] {
-            let (cut, add) = edge_tools(&m, &edges, &segs, size, chamfer);
+            let (cut, add) = edge_tools(&m, &edges, &segs, size, chamfer).unwrap();
             let out = apply_edge_tools(body, &cut, &add);
             let open = open_edges(&Mesh::from_solid(&out));
             assert_eq!(open, 0, "{} {} {}: {} open edges", name, if chamfer { "chamfer" } else { "fillet" }, size, open);
@@ -1535,5 +1611,80 @@ mod watertight {
         let boss = box_solid(DVec3::new(-15.0, -15.0, 0.0), DVec3::new(15.0, 15.0, 5.0)).union(&cylinder_solid(DVec3::new(0.0, 0.0, 4.0), DVec3::Z, 6.0, 8.0));
         let removed = check("boss on plate", &boss, 1.5);
         assert!(removed > 0.0 && removed < 300.0, "removed {} mm3", removed);
+    }
+}
+
+#[cfg(test)]
+mod one_after_another {
+    use super::*;
+
+    /// Rounds the edges picked by `want`, as one feature on the body so far.
+    fn fillet(body: &Solid, size: f64, want: &dyn Fn(&SharpEdge) -> bool) -> Result<Solid, String> {
+        let m = Mesh::from_solid(body);
+        let edges = sharp_edges(&m);
+        let refs: Vec<EdgeRef> = edges.iter().filter(|e| want(e)).map(edge_ref).collect();
+        assert!(!refs.is_empty(), "no edge picked");
+        let (cut, add) = edge_tools(&m, &edges, &selected_segments(&edges, &refs)?, size, false)?;
+        Ok(apply_edge_tools(body, &cut, &add))
+    }
+
+    /// Mesh edges not shared by exactly two triangles, plus triangles folded back onto their
+    /// neighbour.
+    fn defects(r: &Mesh) -> usize {
+        let mut map: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
+        for (t, tri) in r.tris.iter().enumerate() {
+            for k in 0..3 {
+                let (a, b) = (tri[k], tri[(k + 1) % 3]);
+                map.entry((a.min(b), a.max(b))).or_default().push(t);
+            }
+        }
+        map.values().filter(|t| t.len() != 2 || r.tri_normal[t[0]].dot(r.tri_normal[t[1]]) < -0.9).count()
+    }
+
+    fn block() -> Solid {
+        box_solid(DVec3::ZERO, DVec3::new(40.0, 30.0, 20.0))
+    }
+    fn top(e: &SharpEdge) -> bool {
+        e.a.z > 19.99 && e.b.z > 19.99
+    }
+
+    /// Edges rounded one feature at a time. The third and fourth edge end in the roundings
+    /// made before and carry on along them (tangency), down to the bottom of the block: the
+    /// corners become parts of a ball. This used to take some 20 seconds, with a torn mesh
+    /// of 60 000 triangles at the end.
+    #[test]
+    fn fillets_running_into_earlier_ones() {
+        let back = fillet(&block(), 2.0, &|e| top(e) && e.a.y > 29.99 && e.b.y > 29.99).unwrap();
+        let front = fillet(&back, 2.0, &|e| top(e) && e.a.y < 0.01 && e.b.y < 0.01).unwrap();
+        let left = fillet(&front, 2.0, &|e| top(e) && e.a.x < 0.01 && e.b.x < 0.01 && (e.a.y - e.b.y).abs() > 1.0).unwrap();
+        let right = fillet(&left, 2.0, &|e| top(e) && e.a.x > 39.99 && e.b.x > 39.99 && (e.a.y - e.b.y).abs() > 1.0).unwrap();
+        // along the top (26 mm) and down both sides (18 mm each), and at each corner what
+        // the first rounding left of a 2 mm cube around an eighth of a ball
+        let pi = std::f64::consts::PI;
+        let ideal = (4.0 - pi) * (26.0 + 2.0 * 18.0) + 2.0 * (8.0 - pi * 8.0 / 6.0 - (4.0 - pi) * 2.0);
+        for (before, after) in [(&front, &left), (&left, &right)] {
+            let removed = before.volume() - after.volume();
+            assert!((removed - ideal).abs() < 0.015 * ideal, "removed {} mm3, expected about {}", removed, ideal);
+        }
+        let r = Mesh::from_solid(&right);
+        assert_eq!(defects(&r), 0);
+        // the faces away from the edges are still whole
+        assert!(right.polys.len() < 2500 && r.tris.len() < 5000, "{} polygons, {} triangles", right.polys.len(), r.tris.len());
+        // no lines across the ball at the corner next to (0, 0, 20)
+        let on_ball = |p: DVec3| p.x < 1.7 && p.y < 1.7 && p.z > 18.3;
+        assert_eq!(r.edges.iter().filter(|(a, b)| on_ball(*a) && on_ball(*b)).count(), 0);
+    }
+
+    /// A ball cannot roll along the end of a rounding smaller than itself: say so instead
+    /// of cutting a folded tool out of the part.
+    #[test]
+    fn radius_too_large_for_the_rounding_before() {
+        let back = fillet(&block(), 2.0, &|e| top(e) && e.a.y > 29.99 && e.b.y > 29.99).unwrap();
+        let err = fillet(&back, 4.0, &|e| top(e) && e.a.x < 0.01 && e.b.x < 0.01 && (e.a.y - e.b.y).abs() > 1.0).unwrap_err();
+        assert!(err.contains("too large"), "{}", err);
+        // the other way round (large first) is fine
+        let big = fillet(&block(), 4.0, &|e| top(e) && e.a.y > 29.99 && e.b.y > 29.99).unwrap();
+        let both = fillet(&big, 2.0, &|e| top(e) && e.a.x < 0.01 && e.b.x < 0.01 && (e.a.y - e.b.y).abs() > 1.0).unwrap();
+        assert_eq!(defects(&Mesh::from_solid(&both)), 0);
     }
 }

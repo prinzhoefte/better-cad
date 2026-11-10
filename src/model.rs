@@ -584,7 +584,7 @@ fn direct_body(kind: &FeatureKind, body: &Solid) -> Option<Result<Solid, String>
             let m = Mesh::from_solid(body);
             let sharp = sharp_edges(&m);
             let segs = selected_segments(&sharp, edges)?;
-            let (cut, add) = edge_tools(&m, &sharp, &segs, *size, matches!(kind, FeatureKind::Chamfer { .. }));
+            let (cut, add) = edge_tools(&m, &sharp, &segs, *size, matches!(kind, FeatureKind::Chamfer { .. }))?;
             Ok(apply_edge_tools(body, &cut, &add))
         })(),
         FeatureKind::Draft { faces, angle, neutral, reverse } => (|| {
