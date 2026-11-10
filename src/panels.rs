@@ -311,7 +311,7 @@ impl App {
                     "Sketch Tools",
                     vec![
                         ("sk_constr", "Construction / Standard Element", "Make elements helpers (dashed, no material) or normal"),
-                        ("sk_snap", "Snap to Point", "Snap the cursor to the grid on/off"),
+                        ("sk_snap", "Snap to Grid (G)", "Snap the cursor to the grid on/off (G).\nSnapping to points, lines and alignment stays on"),
                     ],
                 ),
                 ("Workbench", vec![("sk_exit", "Exit Workbench", "Leave the sketcher and go back to 3D")]),
@@ -558,6 +558,8 @@ impl App {
                 "sk_snap" => {
                     if let Some(sk) = self.sketch.as_mut() {
                         sk.snap = !sk.snap;
+                        let on = sk.snap;
+                        self.say(if on { "Snap to grid on (G switches it off)." } else { "Snap to grid off (G switches it on). Points, lines and alignment still snap." });
                     }
                 }
                 "sk_constr" => self.toggle_construction(),
@@ -2211,6 +2213,8 @@ impl App {
             "  Pad extrudes the sketch, Pocket cuts it, Shaft / Groove revolve it",
             "  around the sketch's Axis (or its green V axis). Outlines inside outlines are holes.",
             "  Sketcher: Profile / Line draw connected lines; ends snap together (red = open).",
+            "  Points snap to points, lines and in line with other points (dashed guides);",
+            "  G or the dot-grid button switches snapping to the grid on and off.",
             "  Corner, Chamfer, Quick Trim and Mirror edit lines; Construction makes helpers.",
             "  Measure Between / Measure Item: distances, angles, lengths, radii and areas.",
             "  Constraint: dimensions that drive the shape; drag them, double-click to edit.",

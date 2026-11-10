@@ -255,7 +255,11 @@ impl SelfTest {
             ClickSketch(-37.0, 44.0),
             ClickId("sk_select"),
             // grid off, so only the alignment can put the ends exactly in line
-            Call(|a| a.sketch.as_mut().unwrap().snap = false),
+            ClickId("sk_snap"),
+            Check("grid snap off", |a| {
+                let on = a.sketch.as_ref().map_or(true, |s| s.snap);
+                (!on, format!("the Snap to Grid button switched grid snapping {}", if on { "on" } else { "off" }))
+            }),
             Drag(
                 |a| {
                     let f = a.sketch_data()?.frame;
@@ -278,8 +282,8 @@ impl SelfTest {
                     _ => (false, "no line was drawn".into()),
                 }
             }),
+            ClickId("sk_snap"),
             Call(|a| {
-                a.sketch.as_mut().unwrap().snap = true;
                 a.do_undo();
                 a.do_undo();
                 a.do_undo();

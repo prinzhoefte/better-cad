@@ -2119,6 +2119,9 @@ impl App {
         if inp.key(KeyCode::F) && self.sketch.is_none() {
             self.fit_all();
         }
+        if inp.key(KeyCode::G) && self.sketch.is_some() {
+            self.toolbar_command("sk_snap");
+        }
         if inp.key(KeyCode::R) && self.sketch.is_none() && !inp.ctrl {
             self.toggle_realistic();
         }
