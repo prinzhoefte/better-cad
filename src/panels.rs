@@ -394,7 +394,7 @@ impl App {
                 (
                     "Other",
                     vec![
-                        ("tb_import", "Import Mesh", "Bring an STL or OBJ file into this part"),
+                        ("tb_import", "Import Mesh", "Bring an STL, OBJ or CATIA V5 (.CATPart) file into this part"),
                         ("tb_measure", "Measure", "Distance between two points"),
                         ("tb_appear", "Appearance", "Colour and surface finish of this part\n(plastic, 3D print, metal, wood: shown in realistic rendering)"),
                     ],
@@ -411,7 +411,7 @@ impl App {
                 vec![
                     ("as_newpart", "New Part", "Create a new part in the assembly and edit it"),
                     ("as_insert", "Existing Component", "Insert a saved part file (.bcpart)"),
-                    ("as_mesh", "Insert Mesh", "Insert an STL or OBJ file as a component"),
+                    ("as_mesh", "Insert Mesh", "Insert an STL, OBJ or CATIA V5 (.CATPart) file as a component"),
                     ("as_edit", "Edit Part", "Edit the selected component's part (double-click works too)"),
                     ("as_dup", "Duplicate", "Copy the selected component"),
                 ],
@@ -2267,6 +2267,7 @@ impl App {
             "  Save keeps parts (.bcpart) and assemblies (.bcasm) fully editable.",
             "  Export STL for 3D printers (millimetres), OBJ for game engines.",
             "  Import STL/OBJ brings meshes in (e.g. parts exported from other CAD).",
+            "  CATIA V5 parts (.CATPart) open and import too, as a solid without their feature history.",
             "",
             "KEYS  Ctrl+Z undo, Ctrl+Y redo, Ctrl+S save, Del delete, Esc cancel, F fit, R realistic",
             "      Ctrl + / Ctrl - / Ctrl 0: interface size (also Tools > Options, e.g. for 4K).",

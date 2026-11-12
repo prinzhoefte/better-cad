@@ -28,9 +28,9 @@ impl Purpose {
             Purpose::ExportStl => "Export STL (for 3D printing)",
             Purpose::ExportStlSelected => "Export selected part as STL",
             Purpose::ExportObj => "Export OBJ (for games)",
-            Purpose::ImportMesh => "Import STL / OBJ into the part",
+            Purpose::ImportMesh => "Import STL / OBJ / CATPart into the part",
             Purpose::InsertPart => "Insert an existing part",
-            Purpose::InsertMesh => "Insert an STL / OBJ as a component",
+            Purpose::InsertMesh => "Insert an STL / OBJ / CATPart as a component",
             Purpose::SavePartOfComp => "Save selected component's part as",
         }
     }

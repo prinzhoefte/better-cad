@@ -1,4 +1,5 @@
 mod app;
+mod catpart;
 mod files;
 mod geom;
 mod model;
@@ -645,8 +646,8 @@ async fn main() {
     let mut app = App::new();
     // open a document given on the command line (e.g. a double-clicked file)
     let args: Vec<String> = std::env::args().collect();
-    if let Some(f) = args.iter().skip(1).find(|a| !a.starts_with("--") && (a.ends_with(".bcpart") || a.ends_with(".bcasm") || a.ends_with(".stl") || a.ends_with(".obj"))) {
-        if f.ends_with(".stl") || f.ends_with(".obj") {
+    if let Some(f) = args.iter().skip(1).find(|a| !a.starts_with("--") && [".bcpart", ".bcasm", ".stl", ".obj", ".catpart"].iter().any(|e| a.to_lowercase().ends_with(e))) {
+        if ![".bcpart", ".bcasm"].iter().any(|e| f.to_lowercase().ends_with(e)) {
             app.file_chosen(Purpose::ImportMesh, f.clone());
         } else {
             app.file_chosen(Purpose::OpenDoc, f.clone());

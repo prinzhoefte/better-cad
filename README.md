@@ -39,6 +39,7 @@ Every feature stays editable: double-click it in the tree. Rebuilds run in the b
 - Technical shading with edges, or **realistic rendering** (press **R**) with plastic, 3D-print, metal and wood finishes.
 - Native formats `.bcpart` / `.bcasm` keep the full feature history.
 - Export **STL** (for 3D printing, in millimetres) and **OBJ** (for game engines); import STL/OBJ.
+- Open or import **CATIA V5 parts** (`.CATPart`). The solid comes in as a mesh you can keep modelling on; CATIA's feature history is not readable.
 - Number fields accept maths and units: `20*3`, `1.5in`, `2cm`.
 - Adjustable interface size (Ctrl + / Ctrl −, e.g. 200 % on a 4K monitor).
 
@@ -74,7 +75,7 @@ BetterCAD uses [macroquad](https://github.com/not-fl3/macroquad), which also run
 
 | Usage | What it does |
 |---|---|
-| `bettercad part.bcpart` | Open a part, assembly (`.bcasm`) or mesh (`.stl`, `.obj`) |
+| `bettercad part.bcpart` | Open a part, assembly (`.bcasm`) or mesh (`.stl`, `.obj`, `.CATPart`) |
 | `bettercad --scale 150` | Start with the interface at 150 % |
 | `bettercad --screenshot out.png` | Render a few frames, save a screenshot, quit |
 | `bettercad --self-test results.json` | Run the scripted end-to-end UI test and write the results |

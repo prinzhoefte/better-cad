@@ -2132,14 +2132,14 @@ impl App {
 
     pub fn open_file_dialog(&mut self, purpose: Purpose) {
         let exts: Vec<&'static str> = match purpose {
-            Purpose::OpenDoc => vec!["bcpart", "bcasm"],
+            Purpose::OpenDoc => vec!["bcpart", "bcasm", "catpart"],
             Purpose::SaveDoc => match self.doc {
                 Doc::Part(_) => vec!["bcpart"],
                 Doc::Product(_) => vec!["bcasm"],
             },
             Purpose::ExportStl | Purpose::ExportStlSelected => vec!["stl"],
             Purpose::ExportObj => vec!["obj"],
-            Purpose::ImportMesh | Purpose::InsertMesh => vec!["stl", "obj"],
+            Purpose::ImportMesh | Purpose::InsertMesh => vec!["stl", "obj", "catpart"],
             Purpose::InsertPart => vec!["bcpart"],
             Purpose::SavePartOfComp => vec!["bcpart"],
         };
@@ -2205,6 +2205,11 @@ impl App {
         }
         let file_stem = PathBuf::from(&path).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "Part".into());
         match purpose {
+            // a CATIA part opens as a new part holding the imported solid
+            Purpose::OpenDoc if path.to_lowercase().ends_with(".catpart") => {
+                self.new_part_doc();
+                self.file_chosen(Purpose::ImportMesh, path);
+            }
             Purpose::OpenDoc => match load_doc(&path) {
                 Ok(d) => {
                     self.reset_doc(d);
@@ -2295,6 +2300,8 @@ pub fn read_mesh_file(path: &str) -> Result<Vec<[DVec3; 3]>, String> {
     let lower = path.to_lowercase();
     if lower.ends_with(".obj") {
         read_obj(&String::from_utf8_lossy(&bytes))
+    } else if lower.ends_with(".catpart") {
+        crate::catpart::read_catpart(&bytes)
     } else {
         read_stl(&bytes)
     }
