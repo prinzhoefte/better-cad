@@ -25,6 +25,8 @@ pub enum Shape {
     Spline { pts: Vec<DVec2>, closed: bool },
     /// rotation axis for Shaft / Groove (never part of a profile)
     Axis { x1: f64, y1: f64, x2: f64, y2: f64 },
+    /// a sketch point (never part of a profile)
+    Point { x: f64, y: f64 },
 }
 
 fn arc_pts(c: DVec2, r: f64, a0: f64, a1: f64, out: &mut Vec<DVec2>) {
@@ -85,6 +87,7 @@ impl Shape {
             Shape::Ellipse { .. } => "Ellipse",
             Shape::Spline { .. } => "Spline",
             Shape::Axis { .. } => "Axis",
+            Shape::Point { .. } => "Point",
         }
     }
 
@@ -104,6 +107,7 @@ impl Shape {
                 v
             }
             Shape::Spline { pts, closed } => spline_pts(pts, *closed),
+            Shape::Point { x, y } => vec![DVec2::new(*x, *y)],
             _ => self.outline(),
         }
     }
@@ -236,6 +240,7 @@ impl Shape {
                 mp(cx, cy);
                 *rot = a;
             }
+            Shape::Point { x, y } => mp(x, y),
         }
     }
 
@@ -265,6 +270,7 @@ impl Shape {
                 let (a, b) = self.endpoints().unwrap();
                 vec![a, b, DVec2::new(*cx, *cy)]
             }
+            Shape::Point { x, y } => vec![DVec2::new(*x, *y)],
         }
     }
 
@@ -273,6 +279,7 @@ impl Shape {
         match self {
             Shape::Line { x1, y1, x2, y2 } | Shape::Axis { x1, y1, x2, y2 } => vec![DVec2::new(*x1, *y1), DVec2::new(*x2, *y2)],
             Shape::Profile { pts } | Shape::Spline { pts, .. } => pts.clone(),
+            Shape::Point { x, y } => vec![DVec2::new(*x, *y)],
             _ => vec![],
         }
     }
@@ -292,6 +299,10 @@ impl Shape {
                     pts[i] = p;
                 }
             }
+            Shape::Point { x, y } => {
+                *x = p.x;
+                *y = p.y;
+            }
             _ => {}
         }
     }
@@ -309,6 +320,7 @@ impl Shape {
             Shape::Arc { r, a0, a1, .. } => format!("R{}  {}deg", fmt(r.abs()), fmt(sweep_deg(*a0, *a1))),
             Shape::Ellipse { a, b, .. } => format!("{} x {}", fmt(a.abs() * 2.0), fmt(b.abs() * 2.0)),
             Shape::Spline { pts, .. } => format!("{} points", pts.len()),
+            Shape::Point { x, y } => format!("H {}  V {}", fmt(*x), fmt(*y)),
         }
     }
 
@@ -341,6 +353,7 @@ impl Shape {
                 }
                 out
             }
+            Shape::Point { x, y } => vec![v("H", *x), v("V", *y)],
         }
     }
 
@@ -381,6 +394,7 @@ impl Shape {
                     }
                 }
             }
+            Shape::Point { x, y } => *[x, y][i.min(1)] = val,
         }
     }
 
@@ -480,6 +494,10 @@ pub struct Sketch {
     /// each came from. They are locked, never material, and follow their source.
     #[serde(default)]
     pub ext: Vec<Option<ExtRef>>,
+    /// 0: joins were implicit (end points at the same place); 1: joins are Coincidence
+    /// constraints, like in classic CAD
+    #[serde(default)]
+    pub version: u32,
 }
 
 /// An element of another sketch: (sketch feature id, element, piece of the exploded element).
@@ -487,10 +505,23 @@ pub type ExtRef = (u32, usize, usize);
 
 impl Sketch {
     pub fn new(frame: Frame, support: String) -> Sketch {
-        Sketch { frame, support, shapes: vec![], construction: vec![], dims: vec![], ext: vec![] }
+        Sketch { frame, support, shapes: vec![], construction: vec![], dims: vec![], ext: vec![], version: 1 }
+    }
+    /// Turns the implicit joins of an older sketch (end points at the same place) into
+    /// Coincidence constraints.
+    pub fn upgrade(&mut self) {
+        if self.version >= 1 {
+            return;
+        }
+        for i in 0..self.shapes.len() {
+            if !self.is_ext(i) {
+                self.auto_join(i, true);
+            }
+        }
+        self.version = 1;
     }
     pub fn is_construction(&self, i: usize) -> bool {
-        self.construction.get(i).copied().unwrap_or(false) || matches!(self.shapes.get(i), Some(Shape::Axis { .. })) || self.is_ext(i)
+        self.construction.get(i).copied().unwrap_or(false) || matches!(self.shapes.get(i), Some(Shape::Axis { .. }) | Some(Shape::Point { .. })) || self.is_ext(i)
     }
     pub fn is_ext(&self, i: usize) -> bool {
         matches!(self.ext.get(i), Some(Some(_)))
@@ -542,33 +573,236 @@ impl Sketch {
             self.construction[i] = c;
         }
     }
+    /// Adds an element with the constraints classic CAD's SmartPick would give it: horizontal /
+    /// vertical for a level / upright line, and coincidence (or concentricity, midpoint, point
+    /// on curve) where its points sit on other elements.
     pub fn push(&mut self, s: Shape, construction: bool) -> usize {
+        let i = self.push_raw(s, construction);
+        self.auto_hv(i);
+        self.auto_join(i, false);
+        i
+    }
+    /// Adds an element without any constraints.
+    pub fn push_raw(&mut self, s: Shape, construction: bool) -> usize {
         self.construction.resize(self.shapes.len(), false);
-        // a line drawn exactly level or upright gets a horizontal / vertical constraint
-        let hv = match &s {
-            Shape::Line { x1, y1, x2, y2 } => {
-                let d = DVec2::new(x2 - x1, y2 - y1);
-                if d.length() < 1e-9 {
-                    None
-                } else if d.y.abs() < 1e-9 {
-                    Some(crate::dims::DimKind::Horizontal)
-                } else if d.x.abs() < 1e-9 {
-                    Some(crate::dims::DimKind::Vertical)
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        };
         self.ext.resize(self.shapes.len(), None);
         self.shapes.push(s);
         self.construction.push(construction);
         self.ext.push(None);
-        let i = self.shapes.len() - 1;
-        if let Some(kind) = hv {
-            self.dims.push(crate::dims::Dim { kind, a: crate::dims::GRef::Elem(i), b: None, value: 0.0, offset: DVec2::ZERO, reference: false });
+        self.shapes.len() - 1
+    }
+    /// Joins consecutive open elements end to start (and the last to the first when closed).
+    fn link_chain(&mut self, idx: &[usize], closed: bool) {
+        use crate::dims::{Dim, DimKind, GRef};
+        let n = idx.len();
+        for k in 0..(if closed { n } else { n.saturating_sub(1) }) {
+            let (a, b) = (idx[k], idx[(k + 1) % n]);
+            self.dims.push(Dim::new(DimKind::Coincidence, GRef::Key(a, 1), Some(GRef::Key(b, 0)), 0.0));
         }
-        i
+    }
+    /// Adds a closed chain of lines through `pts`, joined and with H / V where level / upright.
+    /// With `smart`, the corners also join what they touch.
+    fn add_loop(&mut self, pts: &[DVec2], construction: bool, smart: bool, hv: bool) -> Vec<usize> {
+        let n = pts.len();
+        let mut idx = vec![];
+        for k in 0..n {
+            let (a, b) = (pts[k], pts[(k + 1) % n]);
+            idx.push(self.push_raw(Shape::Line { x1: a.x, y1: a.y, x2: b.x, y2: b.y }, construction));
+            if k == 0 && smart {
+                // the first corners may sit on other elements (before the loop's own lines exist)
+                self.auto_join(idx[0], false);
+            }
+        }
+        if hv {
+            for &i in &idx {
+                self.auto_hv(i);
+            }
+        }
+        self.link_chain(&idx, true);
+        idx
+    }
+
+    /// A rectangle like classic CAD draws it: four lines, joined, two horizontal and two
+    /// vertical. A centred one also gets a construction diagonal and a centre point at its
+    /// middle. Returns the new elements.
+    pub fn add_rectangle(&mut self, lo: DVec2, hi: DVec2, centred: bool, construction: bool, smart: bool) -> Vec<usize> {
+        use crate::dims::{Dim, DimKind, GRef};
+        let pts = [lo, DVec2::new(hi.x, lo.y), hi, DVec2::new(lo.x, hi.y)];
+        let mut idx = self.add_loop(&pts, construction, smart, true);
+        if centred {
+            let d = self.push_raw(Shape::Line { x1: lo.x, y1: lo.y, x2: hi.x, y2: hi.y }, true);
+            self.dims.push(Dim::new(DimKind::Coincidence, GRef::Key(idx[0], 0), Some(GRef::Key(d, 0)), 0.0));
+            self.dims.push(Dim::new(DimKind::Coincidence, GRef::Key(idx[1], 1), Some(GRef::Key(d, 1)), 0.0));
+            let c = (lo + hi) * 0.5;
+            let p = self.push_raw(Shape::Point { x: c.x, y: c.y }, true);
+            self.dims.push(Dim::new(DimKind::Midpoint, GRef::Elem(p), Some(GRef::Elem(d)), 0.0));
+            if smart {
+                if c.length() < 1e-9 {
+                    self.dims.push(Dim::new(DimKind::Coincidence, GRef::Origin, Some(GRef::Elem(p)), 0.0));
+                }
+            }
+            idx.extend([d, p]);
+        }
+        idx
+    }
+
+    /// A regular polygon: lines joined in a loop with their corners on a construction circle
+    /// and their sides touching a smaller concentric one (so all sides stay equal).
+    pub fn add_polygon(&mut self, c: DVec2, r: f64, n: usize, rot_deg: f64, construction: bool, smart: bool) -> Vec<usize> {
+        use crate::dims::{Dim, DimKind, GRef};
+        let n = n.clamp(3, 64);
+        let pts: Vec<DVec2> = (0..n)
+            .map(|i| {
+                let a = rot_deg.to_radians() + TAU * i as f64 / n as f64 + PI / 2.0;
+                c + DVec2::new(a.cos(), a.sin()) * r
+            })
+            .collect();
+        let lines = self.add_loop(&pts, construction, false, false);
+        // one level or upright side fixes the turn (more would over-constrain)
+        let before = self.dims.len();
+        for &l in &lines {
+            self.auto_hv(l);
+            if self.dims.len() > before {
+                break;
+            }
+        }
+        let outer = self.push_raw(Shape::Circle { cx: c.x, cy: c.y, r }, true);
+        if smart {
+            self.auto_join(outer, false);
+        }
+        let inner = self.push_raw(Shape::Circle { cx: c.x, cy: c.y, r: r * (PI / n as f64).cos() }, true);
+        self.dims.push(Dim::new(DimKind::Concentric, GRef::Elem(outer), Some(GRef::Elem(inner)), 0.0));
+        for &l in &lines {
+            self.dims.push(Dim::new(DimKind::Coincidence, GRef::Key(l, 0), Some(GRef::Elem(outer)), 0.0));
+            self.dims.push(Dim::new(DimKind::Tangent, GRef::Elem(l), Some(GRef::Elem(inner)), 0.0));
+        }
+        let mut idx = lines;
+        idx.extend([outer, inner]);
+        idx
+    }
+
+    /// An elongated hole: two parallel lines and two arcs, tangent where they meet, with the
+    /// arcs centred on the ends of a construction centre line.
+    pub fn add_slot(&mut self, a: DVec2, b: DVec2, r: f64, construction: bool, smart: bool) -> Vec<usize> {
+        use crate::dims::{Dim, DimKind, GRef};
+        let parts = Shape::Slot { x1: a.x, y1: a.y, x2: b.x, y2: b.y, r }.explode();
+        if parts.len() != 4 {
+            return parts.into_iter().map(|p| self.push(p, construction)).collect();
+        }
+        let idx: Vec<usize> = parts.into_iter().map(|p| self.push_raw(p, construction)).collect();
+        let (l1, a1, l2, a2) = (idx[0], idx[1], idx[2], idx[3]);
+        self.link_chain(&idx, true);
+        let ax = self.push_raw(Shape::Line { x1: a.x, y1: a.y, x2: b.x, y2: b.y }, true);
+        self.auto_hv(ax);
+        self.dims.push(Dim::new(DimKind::Coincidence, GRef::Key(a1, 2), Some(GRef::Key(ax, 1)), 0.0));
+        self.dims.push(Dim::new(DimKind::Coincidence, GRef::Key(a2, 2), Some(GRef::Key(ax, 0)), 0.0));
+        for (l, arc) in [(l1, a1), (l2, a1), (l2, a2), (l1, a2)] {
+            self.dims.push(Dim::new(DimKind::Tangent, GRef::Elem(l), Some(GRef::Elem(arc)), 0.0));
+        }
+        self.dims.push(Dim::new(DimKind::Parallel, GRef::Elem(l1), Some(GRef::Elem(l2)), 0.0));
+        if smart {
+            self.auto_join(ax, false);
+        }
+        let mut v = idx;
+        v.push(ax);
+        v
+    }
+
+    /// Drops the constraints on an element's key point (when that point is cut away).
+    pub fn drop_point_constraints(&mut self, i: usize, k: usize) {
+        use crate::dims::GRef;
+        let me = GRef::Key(i, k);
+        self.dims.retain(|d| d.a != me && d.b != Some(me) && d.c != Some(me));
+    }
+
+    /// A line drawn exactly level or upright gets a horizontal / vertical constraint.
+    pub fn auto_hv(&mut self, i: usize) {
+        use crate::dims::{Dim, DimKind, GRef};
+        if let Some(Shape::Line { x1, y1, x2, y2 }) = self.shapes.get(i) {
+            let d = DVec2::new(x2 - x1, y2 - y1);
+            let kind = if d.length() < 1e-9 {
+                return;
+            } else if d.y.abs() < 1e-9 {
+                DimKind::Horizontal
+            } else if d.x.abs() < 1e-9 {
+                DimKind::Vertical
+            } else {
+                return;
+            };
+            self.dims.push(Dim::new(kind, GRef::Elem(i), None, 0.0));
+        }
+    }
+    /// The points of element `i` that get joined to others: (key point index, is a centre).
+    pub fn join_points(&self, i: usize) -> Vec<(usize, bool)> {
+        match self.shapes.get(i) {
+            Some(Shape::Line { .. }) | Some(Shape::Axis { .. }) => vec![(0, false), (1, false)],
+            Some(Shape::Arc { .. }) => vec![(0, false), (1, false), (2, true)],
+            Some(Shape::Circle { .. }) | Some(Shape::Ellipse { .. }) => vec![(0, true)],
+            Some(Shape::Point { .. }) => vec![(0, false)],
+            Some(Shape::Spline { pts, closed: false }) => vec![(0, false), (pts.len() - 1, false)],
+            _ => vec![],
+        }
+    }
+    /// Constrains the points of element `i` to what they touch. With `ends_only`, only end
+    /// points joined to earlier elements' end points (the implicit joins of older sketches).
+    pub fn auto_join(&mut self, i: usize, ends_only: bool) {
+        use crate::dims::{Dim, DimKind, GRef};
+        for (k, centre) in self.join_points(i) {
+            let Some(p) = self.shapes[i].key_points().get(k).copied() else { continue };
+            // already constrained (e.g. by an earlier join)?
+            let me = GRef::Key(i, k);
+            if self.dims.iter().any(|d| matches!(d.kind, DimKind::Coincidence | DimKind::Concentric | DimKind::Midpoint) && (d.a == me || d.b == Some(me))) {
+                continue;
+            }
+            let mut found: Option<Dim> = None;
+            for j in 0..self.shapes.len() {
+                if j == i || (ends_only && j > i) {
+                    continue;
+                }
+                for (kk, jc) in self.join_points(j) {
+                    let q = self.shapes[j].key_points()[kk];
+                    if (q - p).length() >= JOIN_TOL || (ends_only && (centre || jc)) {
+                        continue;
+                    }
+                    let d = if centre && jc {
+                        Dim::new(DimKind::Concentric, GRef::Elem(j), Some(GRef::Elem(i)), 0.0)
+                    } else {
+                        Dim::new(DimKind::Coincidence, GRef::Key(j, kk), Some(me), 0.0)
+                    };
+                    found = Some(d);
+                    break;
+                }
+                if found.is_some() {
+                    break;
+                }
+            }
+            if found.is_none() && !ends_only {
+                if p.length() < 1e-9 {
+                    found = Some(Dim::new(DimKind::Coincidence, GRef::Origin, Some(me), 0.0));
+                } else {
+                    for j in 0..self.shapes.len() {
+                        if j == i {
+                            continue;
+                        }
+                        let s = &self.shapes[j];
+                        // the middle of a line: a midpoint constraint
+                        if let Shape::Line { x1, y1, x2, y2 } = s {
+                            if (DVec2::new(x1 + x2, y1 + y2) * 0.5 - p).length() < 1e-7 {
+                                found = Some(Dim::new(DimKind::Midpoint, me, Some(GRef::Elem(j)), 0.0));
+                                break;
+                            }
+                        }
+                        if matches!(s, Shape::Line { .. } | Shape::Axis { .. } | Shape::Circle { .. } | Shape::Arc { .. }) && (s.nearest_point(p) - p).length() < 1e-7 {
+                            found = Some(Dim::new(DimKind::Coincidence, me, Some(GRef::Elem(j)), 0.0));
+                            break;
+                        }
+                    }
+                }
+            }
+            if let Some(d) = found {
+                self.dims.push(d);
+            }
+        }
     }
     pub fn remove(&mut self, i: usize) {
         self.construction.resize(self.shapes.len(), false);
@@ -692,24 +926,6 @@ impl Sketch {
             if depth % 2 == 0 { solids.push(o.clone()) } else { holes.push(o.clone()) }
         }
         Ok((solids, holes))
-    }
-
-    /// Moves every open-element end point (and profile/spline point) at `old` to `new`, so
-    /// connected elements stay connected. `skip` elements are left alone.
-    pub fn move_point(&mut self, old: DVec2, new: DVec2, skip: &[usize]) {
-        let ext = &self.ext;
-        for (i, s) in self.shapes.iter_mut().enumerate() {
-            // reference elements are locked
-            if skip.contains(&i) || matches!(ext.get(i), Some(Some(_))) {
-                continue;
-            }
-            let hs = s.handle_points();
-            for (k, h) in hs.iter().enumerate() {
-                if (*h - old).length() < JOIN_TOL {
-                    s.set_handle(k, new);
-                }
-            }
-        }
     }
 }
 
@@ -920,8 +1136,15 @@ pub fn corner(sk: &mut Sketch, p: DVec2, r: f64, tol: f64) -> Result<(), String>
     }
     sk.shapes[ia].set_handle(ka, p1);
     sk.shapes[ib].set_handle(kb, p2);
+    sk.drop_point_constraints(ia, ka);
+    sk.drop_point_constraints(ib, kb);
     let constr = sk.is_construction(ia);
-    sk.push(Shape::Arc { cx: c.x, cy: c.y, r, a0: a1, a1: a2 }, constr);
+    let arc = sk.push(Shape::Arc { cx: c.x, cy: c.y, r, a0: a1, a1: a2 }, constr);
+    use crate::dims::{Dim, DimKind, GRef};
+    // like classic CAD, the corner is tangent to both lines
+    for l in [ia, ib] {
+        sk.dims.push(Dim::new(DimKind::Tangent, GRef::Elem(l), Some(GRef::Elem(arc)), 0.0));
+    }
     Ok(())
 }
 
@@ -937,13 +1160,17 @@ pub fn chamfer(sk: &mut Sketch, p: DVec2, dist: f64, tol: f64) -> Result<(), Str
     let p2 = v + (eb - v).normalize() * dist;
     sk.shapes[ia].set_handle(ka, p1);
     sk.shapes[ib].set_handle(kb, p2);
+    sk.drop_point_constraints(ia, ka);
+    sk.drop_point_constraints(ib, kb);
     let constr = sk.is_construction(ia);
     sk.push(Shape::Line { x1: p1.x, y1: p1.y, x2: p2.x, y2: p2.y }, constr);
     Ok(())
 }
 
-/// Mirror copies of `sel` across the line through `a` with direction `d`.
-pub fn mirror(sk: &mut Sketch, sel: &[usize], a: DVec2, d: DVec2) -> Vec<usize> {
+/// Mirror copies of `sel` across the line through `a` with direction `d`. Like classic CAD,
+/// each copy gets a symmetry constraint with its original across `axis` (when given).
+pub fn mirror(sk: &mut Sketch, sel: &[usize], a: DVec2, d: DVec2, axis: Option<crate::dims::GRef>) -> Vec<usize> {
+    use crate::dims::{Dim, DimKind, GRef};
     let d = d.normalize();
     let refl = move |q: DVec2| -> DVec2 {
         let w = q - a;
@@ -955,10 +1182,18 @@ pub fn mirror(sk: &mut Sketch, sel: &[usize], a: DVec2, d: DVec2) -> Vec<usize> 
             continue;
         }
         let c = sk.is_construction(i);
-        let parts = if matches!(sk.shapes[i], Shape::Rect { .. } | Shape::Polygon { .. }) { sk.shapes[i].explode() } else { vec![sk.shapes[i].clone()] };
+        let whole = !matches!(sk.shapes[i], Shape::Rect { .. } | Shape::Polygon { .. });
+        let parts = if whole { vec![sk.shapes[i].clone()] } else { sk.shapes[i].explode() };
         for mut s in parts {
             s.map_points(&refl, true);
-            new.push(sk.push(s, c));
+            let symmetric = whole && matches!(s, Shape::Line { .. } | Shape::Circle { .. } | Shape::Arc { .. } | Shape::Point { .. });
+            let j = if symmetric && axis.is_some() { sk.push_raw(s, c) } else { sk.push(s, c) };
+            if let (true, Some(ax)) = (symmetric, axis) {
+                let mut dm = Dim::new(DimKind::Symmetry, GRef::Elem(i), Some(GRef::Elem(j)), 0.0);
+                dm.c = Some(ax);
+                sk.dims.push(dm);
+            }
+            new.push(j);
         }
     }
     new
@@ -1045,7 +1280,7 @@ mod tests {
         sk.push(line((-10.0, 0.0), (10.0, 0.0)), false);
         let (s, _) = sk.regions().unwrap();
         assert!((signed_area(&s[0]) - PI * 50.0).abs() < 1.0);
-        let new = mirror(&mut sk, &[0], DVec2::ZERO, DVec2::X);
+        let new = mirror(&mut sk, &[0], DVec2::ZERO, DVec2::X, None);
         assert_eq!(new.len(), 1);
         sk.remove(1);
         let (s, _) = sk.regions().unwrap();

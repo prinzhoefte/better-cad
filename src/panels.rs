@@ -38,6 +38,7 @@ impl App {
         self.draw_dialog();
         self.draw_menubar();
         self.draw_ctx_menu();
+        self.draw_sketch_menu();
         if let Dialog::Help = self.dialog {
             self.draw_help();
         }
@@ -297,10 +298,11 @@ impl App {
                         ("sk_profile", "Profile", "Connected lines: click point after point"),
                         ("sk_line", "Line", "A single line between two points"),
                         ("sk_axis", "Axis", "Rotation axis for Shaft and Groove"),
-                        ("sk_rect", "Rectangle", "Rectangle from two opposite corners"),
-                        ("sk_crect", "Centered Rectangle", "Rectangle from its centre and a corner"),
-                        ("sk_polygon", "Hexagon", "Regular polygon (6 sides, editable)"),
-                        ("sk_slot", "Elongated Hole", "Slot: two centres and a width"),
+                        ("sk_point", "Point", "A point (to constrain to, or build from)"),
+                        ("sk_rect", "Rectangle", "Rectangle from two opposite corners:\nfour joined lines, two horizontal, two vertical"),
+                        ("sk_crect", "Centered Rectangle", "Rectangle from its centre and a corner\n(with a centre point)"),
+                        ("sk_polygon", "Hexagon", "Regular hexagon: six joined lines on a construction circle"),
+                        ("sk_slot", "Elongated Hole", "Slot: two centres and a width\n(lines tangent to the arcs)"),
                     ],
                 ),
                 (
@@ -323,7 +325,14 @@ impl App {
                         ("sk_mirror", "Mirror", "Mirror the selected elements across a line"),
                     ],
                 ),
-                ("Constraint", vec![("sk_constraint", "Constraint", "Dimension an element (length, radius, width...) or two elements\n(distance, angle). Drag dimensions to move them,\ndouble-click to change the value: the shape follows.")]),
+                (
+                    "Constraint",
+                    vec![
+                        ("sk_constraint", "Constraint", "Dimension an element (length, radius...) or two items\n(distance, angle): click them, then click to place it.\nRight-click while placing: measure direction, reference.\nDouble-click a dimension to change the value."),
+                        ("sk_condlg", "Constraints Defined in Dialog Box", "Pick one to three items, then tick the constraints:\ndistance, length, angle, radius, coincidence, concentricity,\ntangency, parallelism, perpendicularity, midpoint,\nequidistant point, symmetry, fix, horizontal, vertical"),
+                        ("sk_contact", "Contact Constraint", "Two items touch: concentric circles, a tangent\nline and circle, or coincident points / lines"),
+                    ],
+                ),
                 (
                     "Measure",
                     vec![
@@ -336,6 +345,7 @@ impl App {
                     vec![
                         ("sk_constr", "Construction / Standard Element", "Make elements helpers (dashed, no material) or normal"),
                         ("sk_snap", "Snap to Grid (G)", "Snap the cursor to the grid on/off (G).\nSnapping to points, lines and alignment stays on"),
+                        ("sk_geocons", "Geometrical Constraints", "SmartPick: create coincidence, horizontal, vertical,\nmidpoint and concentricity constraints while drawing"),
                     ],
                 ),
                 ("Workbench", vec![("sk_exit", "Exit Workbench", "Leave the sketcher and go back to 3D")]),
@@ -522,7 +532,11 @@ impl App {
                 "sk_measure" => SkTool::MeasureBetween,
                 "sk_measitem" => SkTool::MeasureItem,
                 "sk_constraint" => SkTool::Constraint,
+                "sk_point" => SkTool::Point,
+                "sk_condlg" => SkTool::ConstraintDlg,
+                "sk_contact" => SkTool::Contact,
                 "sk_snap" => return sk.snap,
+                "sk_geocons" => return sk.auto_cons,
                 "sk_constr" => return sk.construction_mode,
                 _ => return false,
             };
@@ -572,6 +586,9 @@ impl App {
                 "sk_measure" => Some(SkTool::MeasureBetween),
                 "sk_measitem" => Some(SkTool::MeasureItem),
                 "sk_constraint" => Some(SkTool::Constraint),
+                "sk_point" => Some(SkTool::Point),
+                "sk_condlg" => Some(SkTool::ConstraintDlg),
+                "sk_contact" => Some(SkTool::Contact),
                 _ => None,
             };
             if let Some(t) = t {
@@ -587,6 +604,13 @@ impl App {
                     }
                 }
                 "sk_constr" => self.toggle_construction(),
+                "sk_geocons" => {
+                    if let Some(sk) = self.sketch.as_mut() {
+                        sk.auto_cons = !sk.auto_cons;
+                        let on = sk.auto_cons;
+                        self.say(if on { "Geometrical Constraints on: drawing creates coincidence, H / V and other constraints." } else { "Geometrical Constraints off: new elements get no automatic constraints." });
+                    }
+                }
                 "sk_exit" => self.exit_sketch(),
                 _ => {}
             }
@@ -1621,6 +1645,72 @@ impl App {
         }
     }
 
+    /// "Constraint Definition" for Constraints Defined in Dialog Box: the constraints that
+    /// apply to the picked items, to tick and create together.
+    fn constraint_dlg_panel(&mut self) {
+        let Some(data) = self.sketch_data().cloned() else { return };
+        let (picks, ticked) = {
+            let sk = self.sketch.as_ref().unwrap();
+            (sk.picks.clone(), sk.dlg_kinds.clone())
+        };
+        const KINDS: [DimKind; 17] = [
+            DimKind::Distance,
+            DimKind::Length,
+            DimKind::Angle,
+            DimKind::Radius,
+            DimKind::Diameter,
+            DimKind::MajorAxis,
+            DimKind::MinorAxis,
+            DimKind::Symmetry,
+            DimKind::Midpoint,
+            DimKind::Equidistant,
+            DimKind::Fix,
+            DimKind::Coincidence,
+            DimKind::Concentric,
+            DimKind::Tangent,
+            DimKind::Parallel,
+            DimKind::Perpendicular,
+            DimKind::Horizontal,
+        ];
+        let mut kinds: Vec<DimKind> = KINDS.iter().copied().filter(|k| data.make_constraint(*k, &picks).is_some()).collect();
+        if data.make_constraint(DimKind::Vertical, &picks).is_some() {
+            kinds.push(DimKind::Vertical);
+        }
+        let h = 70.0 + kinds.len().max(1) as f32 * 26.0 + 46.0;
+        let r = self.dialog_rect(h);
+        self.ui.panel(r, Some("Constraint Definition"));
+        text(&format!("{} item(s) picked", picks.len()), r.x + 10.0, r.y + 50.0, 15, C_DIM);
+        if kinds.is_empty() {
+            text(if picks.is_empty() { "Click items in the sketch." } else { "No constraint fits these items." }, r.x + 10.0, r.y + 76.0, 15, C_TEXT);
+        }
+        for (k, kind) in kinds.iter().enumerate() {
+            let mut on = ticked.contains(kind);
+            if self.ui.checkbox(&format!("cdlg_{}", k), r.x + 10.0, r.y + 64.0 + k as f32 * 26.0, kind.name(), &mut on) {
+                let sk = self.sketch.as_mut().unwrap();
+                sk.dlg_kinds.retain(|x| x != kind);
+                if on {
+                    sk.dlg_kinds.push(*kind);
+                }
+            }
+        }
+        let ok = self.ui.button("cdlg_ok", Rect::new(r.x + r.w - 190.0, r.y + r.h - 36.0, 86.0, 28.0), "OK");
+        let cancel = self.ui.button("cdlg_cancel", Rect::new(r.x + r.w - 96.0, r.y + r.h - 36.0, 86.0, 28.0), "Cancel");
+        if ok {
+            let ds: Vec<_> = ticked.iter().filter(|k| kinds.contains(k)).filter_map(|k| data.make_constraint(*k, &picks)).collect();
+            if ds.is_empty() {
+                self.err("Tick at least one constraint.");
+            } else if self.add_constraints(ds) {
+                let sk = self.sketch.as_mut().unwrap();
+                sk.picks.clear();
+                sk.dlg_kinds.clear();
+            }
+        } else if cancel {
+            let sk = self.sketch.as_mut().unwrap();
+            sk.picks.clear();
+            sk.dlg_kinds.clear();
+        }
+    }
+
     fn shape_dialog(&mut self) {
         let (tool, sel) = match self.sketch.as_ref() {
             Some(s) => (s.tool, s.sel.clone()),
@@ -1642,6 +1732,10 @@ impl App {
                 *v = val.max(0.01);
             }
             text("Then click a corner where two lines meet.", r.x + 10.0, r.y + 84.0, 15, C_DIM);
+            return;
+        }
+        if tool == SkTool::ConstraintDlg {
+            self.constraint_dlg_panel();
             return;
         }
         if matches!(tool, SkTool::MeasureBetween | SkTool::MeasureItem) {
@@ -1692,13 +1786,13 @@ impl App {
             let r = self.dialog_rect(170.0);
             self.ui.panel(r, Some("Sketcher"));
             let lines = [
-                "1. Pick a tool on the right: Profile and Line",
-                "   draw connected lines, plus rectangles,",
-                "   circles, arcs, ellipses and splines.",
-                "2. Click in the view. Ends snap together;",
-                "   red dots are ends not yet connected.",
-                "3. Select an element to type exact sizes.",
-                "Closed outlines inside others become holes.",
+                "1. Pick a tool on the right: Profile, Line,",
+                "   rectangles, circles, arcs, splines...",
+                "2. Click in the view. Ends snap and get",
+                "   constraints; red dots are open ends.",
+                "3. Constraint: give sizes and positions.",
+                "Green: fully constrained. Purple: over-",
+                "constrained. Red: cannot be satisfied.",
             ];
             for (i, l) in lines.iter().enumerate() {
                 text(l, r.x + 10.0, r.y + 44.0 + i as f32 * 18.0, 15, C_TEXT);
@@ -1758,7 +1852,6 @@ impl App {
         }
         if let Some((fi, val)) = change {
             let mut ns = shape.clone();
-            let old_handles = ns.handle_points();
             ns.set_field(fi, val);
             if !ns.is_open() {
                 let o = ns.outline();
@@ -1767,19 +1860,23 @@ impl App {
                     return;
                 }
             }
-            let new_handles = ns.handle_points();
             self.checkpoint();
+            let mut ok = true;
             if let Some(sd) = self.sketch_data_mut() {
                 if idx < sd.shapes.len() {
+                    let before = sd.shapes.clone();
                     sd.shapes[idx] = ns;
-                    // keep connected elements attached to moved end points
-                    for (o, n) in old_handles.iter().zip(new_handles.iter()) {
-                        if (*o - *n).length() > 1e-12 {
-                            sd.move_point(*o, *n, &[idx]);
-                        }
+                    // the typed numbers rather stay; connected elements follow
+                    let heavy = (0..crate::dims::params(&sd.shapes[idx], 1.0).len()).map(|k| (idx, k)).collect();
+                    if !sd.solve_with(&crate::dims::SolveOpts { heavy, lock: vec![] }) {
+                        sd.shapes = before;
+                        ok = false;
                     }
-                    sd.solve_dims(None);
                 }
+            }
+            if !ok {
+                self.undo.pop();
+                self.err("The constraints do not allow that value.");
             }
             self.touch_sketch();
         }
@@ -2515,6 +2612,35 @@ pub fn draw_icon(id: &str, cx: f32, cy: f32) {
         "sk_crect" => {
             draw_rectangle_lines(cx - 12.0, cy - 8.0, 24.0, 16.0, 2.5, sk);
             draw_circle(cx, cy, 2.0, dark);
+        }
+        "sk_point" => {
+            ln(cx - 6.0, cy - 6.0, cx + 6.0, cy + 6.0, 2.5, sk);
+            ln(cx - 6.0, cy + 6.0, cx + 6.0, cy - 6.0, 2.5, sk);
+        }
+        "sk_condlg" => {
+            let g = Color::new(0.35, 0.95, 0.5, 1.0);
+            draw_rectangle(cx - 13.0, cy - 12.0, 26.0, 24.0, Color::new(0.2, 0.22, 0.26, 1.0));
+            draw_rectangle_lines(cx - 13.0, cy - 12.0, 26.0, 24.0, 1.0, dark);
+            for k in 0..3 {
+                let y = cy - 6.0 + k as f32 * 7.0;
+                draw_rectangle_lines(cx - 10.0, y - 2.5, 5.0, 5.0, 1.0, dark);
+                ln(cx - 2.0, y, cx + 9.0, y, 1.5, dark);
+            }
+            ln(cx - 10.0, cy - 6.0, cx - 8.0, cy - 3.5, 1.5, g);
+            ln(cx - 8.0, cy - 3.5, cx - 4.5, cy - 9.0, 1.5, g);
+        }
+        "sk_contact" => {
+            draw_circle_lines(cx + 3.0, cy + 1.0, 8.0, 2.0, sk);
+            ln(cx - 13.0, cy - 7.0, cx + 13.0, cy - 7.0, 2.0, dark);
+            draw_circle(cx + 3.0, cy - 7.0, 2.5, gold);
+        }
+        "sk_geocons" => {
+            let g = Color::new(0.35, 0.95, 0.5, 1.0);
+            ln(cx - 12.0, cy + 8.0, cx + 4.0, cy + 8.0, 2.0, sk);
+            ln(cx + 4.0, cy + 8.0, cx + 4.0, cy - 8.0, 2.0, sk);
+            draw_circle_lines(cx + 4.0, cy + 8.0, 3.5, 1.5, g);
+            text("H", cx - 9.0, cy + 4.0, 12, g);
+            text("V", cx + 7.0, cy - 2.0, 12, g);
         }
         "sk_line" => {
             ln(cx - 11.0, cy + 9.0, cx + 11.0, cy - 9.0, 2.5, sk);

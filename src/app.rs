@@ -1274,19 +1274,27 @@ impl App {
         if !over_ui && inp.wheel != 0.0 {
             self.view.zoom_at(inp.wheel, inp.mouse);
         }
-        if self.nav != Nav::None {
-            self.hover = None;
-            return;
-        }
-        // right click (without dragging) opens a context menu on what is under the mouse
+        // right click (without dragging) opens a context menu on what is under the mouse; a
+        // right button used for rotating or zooming (with the middle one) never does
         if inp.pressed[RMB] {
             self.rmb_moved = 0.0;
         }
         if inp.down[RMB] {
             self.rmb_moved += delta.length();
+            if self.nav != Nav::None {
+                self.rmb_moved = f32::MAX;
+            }
         }
-        if inp.released[RMB] && self.rmb_moved < 4.0 && !over_ui && self.sketch.is_none() {
-            self.viewport_context_menu(inp.mouse);
+        if self.nav != Nav::None {
+            self.hover = None;
+            return;
+        }
+        if inp.released[RMB] && self.rmb_moved < 4.0 && !over_ui {
+            if self.sketch.is_some() {
+                self.sketch_menu(inp.mouse);
+            } else {
+                self.viewport_context_menu(inp.mouse);
+            }
             return;
         }
         if over_ui && self.gizmo_drag.is_none() && self.sketch.as_ref().map_or(true, |s| s.drag.is_none()) {

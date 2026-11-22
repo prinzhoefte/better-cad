@@ -323,7 +323,7 @@ impl Part {
                 }
             }
             if changed {
-                s.solve_dims(None);
+                s.solve();
                 self.features[j].kind = FeatureKind::Sketch(s);
                 first.get_or_insert(j);
             }
@@ -1139,11 +1139,20 @@ pub fn save_doc(doc: &Doc, path: &str) -> Result<(), String> {
 pub fn load_doc(path: &str) -> Result<Doc, String> {
     let s = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     let mut d: Doc = serde_json::from_str(&s).map_err(|e| format!("not a BetterCAD file ({})", e))?;
+    let fresh = |p: &mut Part| {
+        // older sketches joined elements implicitly: make the joins Coincidence constraints
+        for f in &mut p.features {
+            if let FeatureKind::Sketch(s) = &mut f.kind {
+                s.upgrade();
+            }
+        }
+        p.touch(0);
+    };
     match &mut d {
-        Doc::Part(p) => p.touch(0),
+        Doc::Part(p) => fresh(p),
         Doc::Product(pr) => {
             for c in &mut pr.comps {
-                c.part.touch(0);
+                fresh(&mut c.part);
             }
         }
     }
@@ -1169,6 +1178,7 @@ mod tests {
             construction: vec![],
             dims: vec![],
             ext: vec![],
+            version: 1,
         }));
         p.add_feature(FeatureKind::Pad { sketch: s, length: 20.0, symmetric: false, reverse: false });
         let m = p.mesh();
@@ -1180,6 +1190,7 @@ mod tests {
             construction: vec![],
             dims: vec![],
             ext: vec![],
+            version: 1,
         }));
         p.add_feature(FeatureKind::Pocket { sketch: s2, depth: 10.0, through: false, reverse: false });
         let m = p.mesh();
@@ -1225,6 +1236,7 @@ mod tests {
             construction: vec![],
             dims: vec![],
             ext: vec![],
+            version: 1,
         }));
         let shaft = p.add_feature(FeatureKind::Shaft { sketch: s, angle: 360.0, axis_h: false });
         let m = p.mesh();
@@ -1298,7 +1310,7 @@ mod tests {
         p.touch_id(split);
         assert!((p.mesh().volume() - 6000.0).abs() < 1e-6);
         // a 2 mm stiffener line on top, reaching 3 mm up from z = 20 (reversed: along +Z)
-        let s = p.add_feature(FeatureKind::Sketch(Sketch { frame: Frame { o: DVec3::new(0.0, 0.0, 20.0), u: DVec3::X, v: DVec3::Y }, support: "face".into(), shapes: vec![Shape::Line { x1: -10.0, y1: 0.0, x2: 10.0, y2: 0.0 }], construction: vec![], dims: vec![], ext: vec![] }));
+        let s = p.add_feature(FeatureKind::Sketch(Sketch { frame: Frame { o: DVec3::new(0.0, 0.0, 20.0), u: DVec3::X, v: DVec3::Y }, support: "face".into(), shapes: vec![Shape::Line { x1: -10.0, y1: 0.0, x2: 10.0, y2: 0.0 }], construction: vec![], dims: vec![], ext: vec![], version: 1 }));
         p.add_feature(FeatureKind::Stiffener { sketch: s, thickness: 2.0, depth: 3.0, reverse: true });
         assert!((p.mesh().volume() - 6120.0).abs() < 1e-6, "{}", p.mesh().volume());
         assert!(p.cache.errors.is_empty());
@@ -1308,7 +1320,7 @@ mod tests {
     fn reference_to_earlier_sketch_follows_it() {
         use crate::dims::{Dim, DimKind, GRef};
         let mut p = Part::new("P");
-        let s1 = p.add_feature(FeatureKind::Sketch(Sketch { frame: Frame::xy(), support: "xy".into(), shapes: vec![Shape::Rect { cx: 0.0, cy: 0.0, w: 40.0, h: 30.0, r: 0.0 }], construction: vec![], dims: vec![], ext: vec![] }));
+        let s1 = p.add_feature(FeatureKind::Sketch(Sketch { frame: Frame::xy(), support: "xy".into(), shapes: vec![Shape::Rect { cx: 0.0, cy: 0.0, w: 40.0, h: 30.0, r: 0.0 }], construction: vec![], dims: vec![], ext: vec![], version: 1 }));
         let mut top = Sketch::new(Frame { o: DVec3::new(0.0, 0.0, 20.0), u: DVec3::X, v: DVec3::Y }, "face".into());
         let c = top.push(Shape::Circle { cx: 10.0, cy: 0.0, r: 3.0 }, false);
         // the rectangle's right edge (piece 1 of the exploded rectangle), x = 20
@@ -1320,8 +1332,8 @@ mod tests {
         assert_eq!(edge, Shape::Line { x1: 20.0, y1: -15.0, x2: 20.0, y2: 15.0 });
         let e = top.push_ext(r, edge);
         assert_eq!(top.push_ext(r, Shape::Circle { cx: 0.0, cy: 0.0, r: 1.0 }), e, "adopting twice reuses the reference");
-        top.dims.push(Dim { kind: DimKind::Distance, a: GRef::Key(c, 0), b: Some(GRef::Elem(e)), value: 5.0, offset: DVec2::ZERO, reference: false });
-        top.solve_dims(None);
+        top.dims.push(Dim::new(DimKind::Distance, GRef::Key(c, 0), Some(GRef::Elem(e)), 5.0));
+        assert!(top.solve());
         let centre_x = |p: &Part, id: u32| match &p.feature(id).unwrap().kind {
             FeatureKind::Sketch(s) => match s.shapes[0] {
                 Shape::Circle { cx, .. } => cx,

@@ -63,6 +63,12 @@ enum Act {
     Check(&'static str, fn(&mut App) -> (bool, String)),
 }
 
+/// The world position of a point of the sketch being edited.
+fn sketch_world(a: &mut App, u: f64, v: f64) -> DVec3 {
+    let f = a.sketch_data().map(|s| s.frame).unwrap();
+    a.part_model().transform_point3(f.to3(DVec2::new(u, v), 0.0))
+}
+
 struct SelfTest {
     path: String,
     acts: Vec<Act>,
@@ -87,16 +93,69 @@ impl SelfTest {
             ClickId("sk_rect"),
             ClickSketch(-20.0, -15.0),
             ClickSketch(20.0, 15.0),
-            // type exact sizes into the shape's fields, like a user would
-            ClickId("shape_f0"),
-            Type("0"),
-            ClickId("shape_f1"),
-            Type("0"),
-            ClickId("shape_f2"),
-            Type("40"),
-            ClickId("shape_f3"),
-            Type("30"),
+            Check("rectangle", |a| {
+                let s = match a.sketch_data() {
+                    Some(s) => s.clone(),
+                    None => return (false, "not in the sketcher".into()),
+                };
+                let lines = s.shapes.iter().filter(|x| matches!(x, Shape::Line { .. })).count();
+                let n = |k: dims::DimKind| s.dims.iter().filter(|d| d.kind == k).count();
+                let ok = lines == 4 && n(dims::DimKind::Horizontal) == 2 && n(dims::DimKind::Vertical) == 2 && n(dims::DimKind::Coincidence) == 4;
+                (ok, format!("Rectangle drew {} lines with {} H, {} V and {} coincidence constraints (classic CAD rectangle)", lines, n(dims::DimKind::Horizontal), n(dims::DimKind::Vertical), n(dims::DimKind::Coincidence)))
+            }),
+            // exact sizes with the Constraint tool, like a user would: click the bottom line,
+            // click where the dimension goes, double-click it and type the value
+            ClickId("sk_constraint"),
+            ClickSketch(3.0, -15.0),
+            ClickSketch(3.0, -22.0),
             Wait(2),
+            DoubleClickId("dim_sel"),
+            Wait(2),
+            Type("40"),
+            ClickId("dim_ok"),
+            ClickId("sk_constraint"),
+            ClickSketch(20.0, 4.0),
+            ClickSketch(27.0, 4.0),
+            Wait(2),
+            DoubleClickId("dim_sel"),
+            Wait(2),
+            Type("30"),
+            ClickId("dim_ok"),
+            // position it from the axes: line, axis, then where the distance goes
+            ClickId("sk_constraint"),
+            ClickSketch(5.0, -15.0),
+            ClickSketch(5.0, 0.0),
+            ClickSketch(9.0, -7.0),
+            Wait(2),
+            DoubleClickId("dim_sel"),
+            Wait(2),
+            Type("15"),
+            ClickId("dim_ok"),
+            ClickId("sk_constraint"),
+            ClickSketch(-20.0, 5.0),
+            ClickSketch(0.0, 5.0),
+            ClickSketch(-10.0, 9.0),
+            Wait(2),
+            DoubleClickId("dim_sel"),
+            Wait(2),
+            Type("20"),
+            ClickId("dim_ok"),
+            Wait(2),
+            Check("fully constrained", |a| {
+                let s = match a.sketch_data() {
+                    Some(s) => s.clone(),
+                    None => return (false, "not in the sketcher".into()),
+                };
+                let st = s.analyze();
+                let iso = st.elems.iter().filter(|e| **e == dims::CState::Iso).count();
+                let (mut lo, mut hi) = (DVec2::splat(f64::MAX), DVec2::splat(f64::MIN));
+                for p in s.shapes.iter().flat_map(|x| x.key_points()) {
+                    lo = lo.min(p);
+                    hi = hi.max(p);
+                }
+                let ok = iso == 4 && st.dims.iter().all(|d| *d == dims::CState::Iso) && (lo - DVec2::new(-20.0, -15.0)).length() < 1e-6 && (hi - DVec2::new(20.0, 15.0)).length() < 1e-6;
+                (ok, format!("width, height and the distances to the H / V axes make all {} lines fully constrained (green); the rectangle spans H {} .. {}, V {} .. {}", iso, fmt(lo.x), fmt(hi.x), fmt(lo.y), fmt(hi.y)))
+            }),
             ClickId("sk_exit"),
             Wait(40),
             ClickId("tb_pad"),
@@ -149,7 +208,7 @@ impl SelfTest {
                 let refs = (0..s.shapes.len()).filter(|i| s.is_ext(*i)).count();
                 let d = s.dims.first().cloned();
                 let ok = refs == 1 && d.as_ref().map_or(false, |d| d.reference && (d.value - 30.0).abs() < 1e-9);
-                (ok, format!("clicked the first sketch's edge in a new sketch: {} reference element(s), dimension {}", refs, d.map(|d| d.label()).unwrap_or("none".into())))
+                (ok, format!("clicked the first sketch's edge in a new sketch: {} reference element(s), dimension {} ", refs, d.map(|d| d.label()).unwrap_or("none".into())))
             }),
             ClickId("sk_exit"),
             Wait(10),
@@ -306,10 +365,58 @@ impl SelfTest {
                 }
             }),
             ClickId("sk_snap"),
+            // Contact Constraint on the two parallel lines: they become collinear
+            ClickId("sk_contact"),
+            ClickWorld(|a| sketch_world(a, -52.0, 50.0)),
+            ClickWorld(|a| {
+                let y = match a.sketch_data().and_then(|d| d.shapes.last().cloned()) {
+                    Some(Shape::Line { y1, .. }) => y1,
+                    _ => 46.0,
+                };
+                sketch_world(a, -52.0, y)
+            }),
+            Check("contact", |a| {
+                let s = match a.sketch_data() {
+                    Some(s) => s.clone(),
+                    None => return (false, "not in the sketcher".into()),
+                };
+                let n = s.shapes.len();
+                let ys: Vec<f64> = s.shapes[n - 2..].iter().filter_map(|x| if let Shape::Line { y1, y2, .. } = x { Some((y1 + y2) / 2.0) } else { None }).collect();
+                let ok = ys.len() == 2 && (ys[0] - ys[1]).abs() < 1e-7 && s.dims.iter().any(|d| d.kind == dims::DimKind::Coincidence && d.b.is_some() && d.a == dims::GRef::Elem(n - 2));
+                (ok, format!("Contact Constraint on two parallel lines made them collinear (both at V {})", ys.iter().map(|y| fmt((y * 1000.0).round() / 1000.0)).collect::<Vec<_>>().join(" and ")))
+            }),
+            // Constraints Defined in Dialog Box: pick a line, tick Fix, OK
+            ClickId("sk_condlg"),
+            ClickWorld(|a| {
+                let y = match a.sketch_data().and_then(|d| d.shapes.last().cloned()) {
+                    Some(Shape::Line { y1, .. }) => y1,
+                    _ => 46.0,
+                };
+                sketch_world(a, -52.0, y)
+            }),
+            Wait(2),
+            Check("dialog box", |a| {
+                let ids: Vec<String> = a.ui.prev_ids.keys().filter(|k| k.starts_with("cdlg_")).cloned().collect();
+                (ids.iter().any(|k| k == "cdlg_1"), format!("Constraints Defined in Dialog Box lists {} constraints for a line", ids.iter().filter(|k| k[5..].parse::<usize>().is_ok()).count()))
+            }),
+            ClickId("cdlg_1"),
+            ClickId("cdlg_ok"),
+            Check("fix", |a| {
+                let s = match a.sketch_data() {
+                    Some(s) => s.clone(),
+                    None => return (false, "not in the sketcher".into()),
+                };
+                let fixed: Vec<usize> = (0..s.shapes.len()).filter(|i| s.is_fixed(*i)).collect();
+                let st = s.analyze();
+                // it already was horizontal and collinear with the other line: over-constrained
+                let ok = fixed.len() == 1 && st.elems[fixed[0]] != dims::CState::Under;
+                (ok, format!("ticked Fix in the dialog: element {} is fixed (status {:?}: it was already horizontal and collinear, so classic CAD shows it over-constrained)", fixed.first().map_or(0, |i| i + 1), st.elems.get(fixed.first().copied().unwrap_or(0))))
+            }),
+            ClickId("sk_select"),
             Call(|a| {
-                a.do_undo();
-                a.do_undo();
-                a.do_undo();
+                for _ in 0..5 {
+                    a.do_undo();
+                }
             }),
             ClickId("sk_exit"),
             Wait(40),

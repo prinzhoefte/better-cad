@@ -33,6 +33,11 @@ pub enum SkTool {
     MeasureBetween,
     MeasureItem,
     Constraint,
+    Point,
+    /// "Constraints Defined in Dialog Box": pick items, then tick the constraints to create
+    ConstraintDlg,
+    /// "Contact Constraint": coincidence, concentricity or tangency between two items
+    Contact,
 }
 
 impl SkTool {
@@ -58,11 +63,15 @@ impl SkTool {
             SkTool::Mirror => "Mirror: select elements first, then click a line, the axis or the H / V axis to mirror across.",
             SkTool::MeasureBetween => "Measure Between: click a first item (point, line, circle, arc or the H / V axis), then a second one.",
             SkTool::MeasureItem => "Measure Item: click a line, arc, circle, closed shape or point to see its sizes.",
-            SkTool::Constraint => "Constraint: click an element and then empty space to place its dimension, or click two elements for a distance / angle. Double-click a dimension to change it.",
+            SkTool::Constraint => "Constraint: click an element, then click where the dimension goes; or click two items, then click to place the distance / angle. Right-click while placing for more options. Double-click a dimension to change it.",
+            SkTool::Point => "Point: click to place a point.",
+            SkTool::ConstraintDlg => "Constraints Defined in Dialog Box: click one, two or three items (points, lines, circles, H / V axis), then tick the constraints on the right.",
+            SkTool::Contact => "Contact Constraint: click two items. Two circles become concentric, a line and a circle tangent, anything else coincident.",
         }
     }
     fn needed(self) -> usize {
         match self {
+            SkTool::Point => 0,
             SkTool::Line | SkTool::Axis | SkTool::Rect | SkTool::CRect | SkTool::Circle | SkTool::Polygon => 1,
             SkTool::Circle3 | SkTool::Arc | SkTool::Arc3 | SkTool::Ellipse | SkTool::Slot => 2,
             _ => usize::MAX,
@@ -73,7 +82,8 @@ impl SkTool {
 #[derive(Clone)]
 pub enum SkDrag {
     Shapes { start: DVec2, orig: Vec<Shape>, moved: bool },
-    Point { p0: DVec2, orig: Vec<Shape>, moved: bool },
+    /// a handle point (element, handle index) being dragged
+    Point { p0: DVec2, elem: usize, k: usize, orig: Vec<Shape>, moved: bool },
     Box { start: DVec2 },
     Dim { idx: usize, start: DVec2, orig: DVec2, moved: bool },
 }
@@ -100,8 +110,27 @@ pub struct SketchEdit {
     pub measures: Vec<SkMeasure>,
     pub meas_first: Option<MeasItem>,
     pub keep_measures: bool,
+    /// lines of the profile being drawn
+    pub profile: Vec<usize>,
     /// first item picked with the Constraint tool
     pub cons_first: Option<GRef>,
+    /// second item: the distance / angle now follows the cursor until it is placed
+    pub cons_second: Option<GRef>,
+    /// right-click choices for the dimension being placed: measure direction, reference,
+    /// radius instead of diameter (or the other way round)
+    pub cons_dir: MeasDir,
+    pub cons_ref: bool,
+    pub cons_alt: bool,
+    /// items picked for Constraints Defined in Dialog Box / Contact Constraint
+    pub picks: Vec<GRef>,
+    /// constraints ticked in the dialog
+    pub dlg_kinds: Vec<DimKind>,
+    /// classic CAD "Geometrical Constraints" (SmartPick creates constraints while drawing)
+    pub auto_cons: bool,
+    /// right-click menu: where, and its entries
+    pub menu: Option<(Vec2, Vec<&'static str>)>,
+    /// constraint status of the sketch as it was last analysed
+    pub status: Option<(Vec<Shape>, Vec<Dim>, SkStatus)>,
     pub sel_dim: Option<usize>,
     /// where each dimension's text was drawn (screen), for clicking and dragging it
     pub dim_rects: Vec<(usize, Rect)>,
@@ -113,6 +142,7 @@ pub fn preview(tool: SkTool, pts: &[DVec2], c: DVec2) -> Vec<Shape> {
     let line = |a: DVec2, b: DVec2| Shape::Line { x1: a.x, y1: a.y, x2: b.x, y2: b.y };
     let n = pts.len();
     let out: Option<Shape> = match (tool, n) {
+        (SkTool::Point, 0) => Some(Shape::Point { x: c.x, y: c.y }),
         (SkTool::Line, 1) | (SkTool::Profile, 1..) => Some(line(pts[n - 1], c)),
         (SkTool::Axis, 1) => Some(Shape::Axis { x1: pts[0].x, y1: pts[0].y, x2: c.x, y2: c.y }),
         (SkTool::Rect, 1) => {
@@ -184,8 +214,16 @@ impl App {
             sk.drag = None;
             sk.meas_first = None;
             sk.cons_first = None;
+            sk.cons_second = None;
+            sk.menu = None;
+            sk.picks.clear();
+            sk.dlg_kinds.clear();
             if !sk.keep_measures && !matches!(t, SkTool::MeasureBetween | SkTool::MeasureItem) {
                 sk.measures.clear();
+            }
+            // Constraints Defined in Dialog Box starts from the selected elements
+            if t == SkTool::ConstraintDlg {
+                sk.picks = sk.sel.iter().take(3).map(|i| GRef::Elem(*i)).collect();
             }
             if t != SkTool::Select && t != SkTool::Mirror {
                 sk.sel.clear();
@@ -286,22 +324,23 @@ impl App {
         best.map(|b| b.1)
     }
 
-    fn handle_near(&self, p: DVec2) -> Option<DVec2> {
+    /// The handle point near `p`: (where, element, handle index).
+    fn handle_near(&self, p: DVec2) -> Option<(DVec2, usize, usize)> {
         let data = self.sketch_data()?;
         let px = self.sketch_px();
-        let mut best: Option<(f64, DVec2)> = None;
+        let mut best: Option<(f64, DVec2, usize, usize)> = None;
         for (i, s) in data.shapes.iter().enumerate() {
             if data.is_ext(i) {
                 continue;
             }
-            for h in s.handle_points() {
+            for (k, h) in s.handle_points().into_iter().enumerate() {
                 let d = (h - p).length();
-                if d < px * 7.0 && best.map_or(true, |b| d < b.0) {
-                    best = Some((d, h));
+                if d < px * 7.0 && best.map_or(true, |b| d < b.0 - 1e-9) {
+                    best = Some((d, h, i, k));
                 }
             }
         }
-        best.map(|b| b.1)
+        best.map(|b| (b.1, b.2, b.3))
     }
 
     pub fn sketch_input(&mut self, inp: &Input) {
@@ -514,7 +553,10 @@ impl App {
         let tool = sk.tool;
         let (corner_r, chamfer_d) = (sk.corner_r, sk.chamfer_d);
 
-        if matches!(tool, SkTool::Select | SkTool::Constraint) && self.dim_text_input(inp, raw) {
+        if self.sketch.as_ref().unwrap().menu.is_some() {
+            return;
+        }
+        if matches!(tool, SkTool::Select | SkTool::Constraint) && self.sketch.as_ref().unwrap().cons_second.is_none() && self.dim_text_input(inp, raw) {
             return;
         }
         match tool {
@@ -522,6 +564,11 @@ impl App {
             SkTool::Constraint => {
                 if inp.pressed[LMB] {
                     self.constraint_click(raw, px);
+                }
+            }
+            SkTool::ConstraintDlg | SkTool::Contact => {
+                if inp.pressed[LMB] {
+                    self.pick_click(raw, px, tool);
                 }
             }
             SkTool::Corner | SkTool::Chamfer => {
@@ -619,7 +666,18 @@ impl App {
                     match line {
                         Some((a, dir)) if dir.length() > 1e-9 => {
                             let mut s = data.clone();
-                            let new = mirror(&mut s, &sel, a, dir);
+                            let axis = if !self.sketch.as_ref().unwrap().auto_cons {
+                                None
+                            } else if let Some(i) = data.shapes.iter().enumerate().position(|(i, sh)| !sel.contains(&i) && matches!(sh, Shape::Line { .. } | Shape::Axis { .. }) && sh.distance(raw) < px * 8.0 && sh.distance(a) < 1e-9) {
+                                Some(GRef::Elem(i))
+                            } else if dir.y.abs() < 1e-12 && a.y.abs() < 1e-12 {
+                                Some(GRef::AxisH)
+                            } else if dir.x.abs() < 1e-12 && a.x.abs() < 1e-12 {
+                                Some(GRef::AxisV)
+                            } else {
+                                None
+                            };
+                            let new = mirror(&mut s, &sel, a, dir, axis);
                             self.commit_sketch(s);
                             if let Some(sk) = self.sketch.as_mut() {
                                 sk.sel = new;
@@ -650,32 +708,37 @@ impl App {
                             let sel = self.sketch.as_ref().unwrap().sel.clone();
                             if let Some(sd) = self.sketch_data_mut() {
                                 sd.shapes = orig.clone();
+                                let mut heavy = vec![];
                                 for &i in &sel {
-                                    if i < sd.shapes.len() && !sd.is_ext(i) {
-                                        let old = sd.shapes[i].handle_points();
+                                    if i < sd.shapes.len() && !sd.is_ext(i) && !sd.is_fixed(i) {
                                         sd.shapes[i].translate(delta);
-                                        // connected neighbours follow the moved end points
-                                        for p in old {
-                                            sd.move_point(p, p + delta, &sel);
-                                        }
+                                        heavy.extend((0..params(&sd.shapes[i], 1.0).len()).map(|k| (i, k)));
                                     }
                                 }
-                                // dimensions stay true while dragging
-                                sd.solve_dims(None);
+                                // the constraints decide what follows (connected elements) and
+                                // what cannot move at all (then nothing moves)
+                                if !sd.solve_with(&SolveOpts { heavy, lock: vec![] }) {
+                                    sd.shapes = orig.clone();
+                                }
                             }
                             self.touch_sketch();
                         }
                     }
-                    SkDrag::Point { p0, orig, moved } => {
+                    SkDrag::Point { p0, elem, k, orig, moved } => {
                         if (cur - p0).length() > 1e-12 || moved {
                             if !moved {
                                 self.checkpoint();
-                                self.sketch.as_mut().unwrap().drag = Some(SkDrag::Point { p0, orig: orig.clone(), moved: true });
+                                self.sketch.as_mut().unwrap().drag = Some(SkDrag::Point { p0, elem, k, orig: orig.clone(), moved: true });
                             }
                             if let Some(sd) = self.sketch_data_mut() {
                                 sd.shapes = orig.clone();
-                                sd.move_point(p0, cur, &[]);
-                                sd.solve_dims(None);
+                                if elem < sd.shapes.len() {
+                                    sd.shapes[elem].set_handle(k, cur);
+                                    let heavy = handle_params(&sd.shapes[elem], k).into_iter().map(|p| (elem, p)).collect();
+                                    if !sd.solve_with(&SolveOpts { heavy, lock: vec![] }) {
+                                        sd.shapes = orig.clone();
+                                    }
+                                }
                             }
                             self.touch_sketch();
                         }
@@ -711,8 +774,8 @@ impl App {
         }
         if inp.pressed[LMB] {
             let orig = self.sketch_data().map(|d| d.shapes.clone()).unwrap_or_default();
-            if let Some(h) = self.handle_near(raw) {
-                self.sketch.as_mut().unwrap().drag = Some(SkDrag::Point { p0: h, orig, moved: false });
+            if let Some((h, elem, k)) = self.handle_near(raw) {
+                self.sketch.as_mut().unwrap().drag = Some(SkDrag::Point { p0: h, elem, k, orig, moved: false });
                 return;
             }
             let hover = self.sketch_hover_shape();
@@ -749,12 +812,14 @@ impl App {
         if tool == SkTool::Profile {
             if (finish_key || inp.double_click) && !sk.pts.is_empty() {
                 sk.pts.clear();
+                sk.profile.clear();
                 self.say("Profile finished. Start another, or pick a different tool.");
                 return;
             }
             if inp.pressed[LMB] {
                 if sk.pts.is_empty() {
                     sk.pts.push(cur);
+                    sk.profile.clear();
                     return;
                 }
                 let last = *sk.pts.last().unwrap();
@@ -765,8 +830,27 @@ impl App {
                 let closing = sk.pts.len() >= 2 && (cur - first).length() < px * 2.0;
                 let end = if closing { first } else { cur };
                 let added = self.add_shapes(vec![Shape::Line { x1: last.x, y1: last.y, x2: end.x, y2: end.y }], false);
+                if added && !self.sketch.as_ref().unwrap().auto_cons {
+                    // the lines of a profile are always joined
+                    let n = self.sketch_data().map_or(0, |d| d.shapes.len());
+                    let first = self.sketch.as_ref().unwrap().profile.first().copied();
+                    let prev = self.sketch.as_ref().unwrap().profile.last().copied();
+                    if let Some(sd) = self.sketch_data_mut() {
+                        if let Some(p) = prev {
+                            sd.dims.push(Dim::new(DimKind::Coincidence, GRef::Key(p, 1), Some(GRef::Key(n - 1, 0)), 0.0));
+                        }
+                        if let (true, Some(f)) = (closing, first) {
+                            sd.dims.push(Dim::new(DimKind::Coincidence, GRef::Key(n - 1, 1), Some(GRef::Key(f, 0)), 0.0));
+                        }
+                    }
+                }
+                let n = self.sketch_data().map_or(0, |d| d.shapes.len());
                 let sk = self.sketch.as_mut().unwrap();
+                if added {
+                    sk.profile.push(n - 1);
+                }
                 if added && closing {
+                    sk.profile.clear();
                     sk.pts.clear();
                     self.say("Profile closed.");
                 } else if added {
@@ -804,7 +888,7 @@ impl App {
                     }
                 }
                 if !shapes.is_empty() {
-                    self.add_shapes(shapes, true);
+                    self.add_shapes_as(shapes, true, tool == SkTool::CRect);
                 }
             } else if sk.pts.last().map_or(true, |l| (*l - cur).length() > 1e-9) {
                 sk.pts.push(cur);
@@ -814,69 +898,115 @@ impl App {
 
     /// The dimension reference under a sketch point: a key point, an element, an axis.
     fn pick_gref(&self, data: &Sketch, raw: DVec2, px: f64) -> Option<GRef> {
-        match pick_item(data, raw, px * 8.0)? {
-            MeasItem::Point(p) => {
-                if p.length() < JOIN_TOL {
-                    return Some(GRef::Origin);
+        let tol = px * 8.0;
+        // real points only, like classic CAD: ends, centres, points (not line middles or
+        // circle quadrants); the sketch's own before references, line ends before others
+        let mut found: Option<(f64, u8, GRef)> = None;
+        if raw.length() < tol {
+            found = Some((raw.length(), 4, GRef::Origin));
+        }
+        for (i, s) in data.shapes.iter().enumerate() {
+            let real: Vec<usize> = match s {
+                Shape::Line { .. } | Shape::Axis { .. } => vec![0, 1],
+                Shape::Arc { .. } => vec![0, 1, 2],
+                Shape::Circle { .. } | Shape::Ellipse { .. } | Shape::Point { .. } => vec![0],
+                _ => (0..s.key_points().len()).collect(),
+            };
+            let kp = s.key_points();
+            for k in real {
+                let Some(q) = kp.get(k) else { continue };
+                let d = (*q - raw).length();
+                if d >= tol {
+                    continue;
                 }
-                // prefer the sketch's own elements over references, then line end points
-                let mut found: Option<(u8, GRef)> = None;
-                for (i, s) in data.shapes.iter().enumerate() {
-                    for (k, q) in s.key_points().iter().enumerate() {
-                        if (*q - p).length() < JOIN_TOL {
-                            let is_line_end = matches!(s, Shape::Line { .. } | Shape::Axis { .. }) && k < 2;
-                            let rank = 2 * !data.is_ext(i) as u8 + is_line_end as u8;
-                            if found.map_or(true, |(r, _)| rank > r) {
-                                found = Some((rank, GRef::Key(i, k)));
-                            }
-                        }
-                    }
+                let is_line_end = matches!(s, Shape::Line { .. } | Shape::Axis { .. });
+                let rank = 2 * !data.is_ext(i) as u8 + is_line_end as u8;
+                let g = if let Shape::Point { .. } = s { GRef::Elem(i) } else { GRef::Key(i, k) };
+                let better = match found {
+                    None => true,
+                    Some((bd, br, _)) => d < bd - JOIN_TOL || (d < bd + JOIN_TOL && rank > br),
+                };
+                if better {
+                    found = Some((d, rank, g));
                 }
-                found.map(|f| f.1)
             }
+        }
+        if let Some(f) = found {
+            return Some(f.2);
+        }
+        match pick_item(data, raw, tol)? {
+            MeasItem::Point(_) => data.shapes.iter().enumerate().filter(|(_, s)| s.distance(raw) < tol).min_by(|a, b| a.1.distance(raw).total_cmp(&b.1.distance(raw))).map(|(i, _)| GRef::Elem(i)),
             MeasItem::Elem(i) => Some(GRef::Elem(i)),
             MeasItem::AxisH => Some(GRef::AxisH),
             MeasItem::AxisV => Some(GRef::AxisV),
         }
     }
 
+    /// The distance / angle between two picked items, placed at `place`, measured the way
+    /// the right-click menu says.
+    pub fn pending_dim(&self, data: &Sketch, a: GRef, b: GRef, place: DVec2) -> Option<Dim> {
+        let sk = self.sketch.as_ref()?;
+        let mut d = data.pair_dim_for(a, b, place)?;
+        if d.kind == DimKind::Distance && sk.cons_dir != MeasDir::Normal && matches!((data.form(&a), data.form(&b)), (Some(Form::Pt(_)), Some(Form::Pt(_)))) {
+            d.dir = sk.cons_dir;
+            d.value = data.dim_measure(&d)?.abs();
+            d.offset = place - data.dim_anchor(&d)?;
+        }
+        Some(d)
+    }
+
+    /// The dimension one picked element gets (radius or diameter as the menu says).
+    fn single_dim(&self, data: &Sketch, i: usize, place: DVec2) -> Option<Dim> {
+        let mut d = data.single_dim_for(i, place)?;
+        if self.sketch.as_ref()?.cons_alt && matches!(d.kind, DimKind::Radius | DimKind::Diameter) && matches!(data.shapes[i], Shape::Circle { .. } | Shape::Arc { .. }) {
+            d.kind = if d.kind == DimKind::Radius { DimKind::Diameter } else { DimKind::Radius };
+            d.value = data.dim_measure(&d)?.abs();
+        }
+        Some(d)
+    }
+
     fn constraint_click(&mut self, raw: DVec2, px: f64) {
         // an element of an earlier sketch becomes a reference element when picked
         let Some((tmp, n)) = self.sketch_with_refs() else { return };
+        let (first, second) = {
+            let sk = self.sketch.as_ref().unwrap();
+            (sk.cons_first, sk.cons_second)
+        };
+        // third click: place the distance / angle
+        if let (Some(a), Some(b)) = (first, second) {
+            let data = match self.sketch_data() {
+                Some(d) => d.clone(),
+                None => return,
+            };
+            match self.pending_dim(&data, a, b, raw) {
+                Some(d) => self.finish_dim(d),
+                None => {
+                    self.err("Those two cannot be dimensioned together.");
+                    self.reset_constraint_tool();
+                }
+            }
+            return;
+        }
         let picked = self.pick_gref(&tmp, raw, px).map(|g| self.adopt_ref(&tmp, n, g));
         let data = match self.sketch_data() {
             Some(d) => d.clone(),
             None => return,
         };
-        let first = self.sketch.as_ref().unwrap().cons_first;
-        let new_dim = match (first, picked) {
+        match (first, picked) {
             (None, Some(g)) => {
+                self.reset_constraint_tool();
                 self.sketch.as_mut().unwrap().cons_first = Some(g);
-                self.say("Constraint: click empty space to place the dimension, or click a second element for a distance or angle.");
-                return;
+                self.say("Constraint: click where the dimension goes, or click a second item for a distance or angle. Right-click for options.");
             }
-            (None, None) => {
-                self.err("Click an element, a point or the H / V axis to dimension.");
-                return;
-            }
+            (None, None) => self.err("Click an element, a point or the H / V axis to dimension."),
             (Some(a), Some(b)) if a != b => {
-                // place the text a little to the side of the pair
-                let mut d = match data.pair_dim_for(a, b, raw) {
-                    Some(d) => d,
-                    None => {
-                        self.err("Those two cannot be dimensioned together (pick points, lines, circles or an axis).");
-                        self.sketch.as_mut().unwrap().cons_first = None;
-                        return;
-                    }
-                };
-                if d.kind != DimKind::Angle {
-                    if let Some(DimGeom::Linear { n, .. }) = data.dim_geom(&Dim { offset: DVec2::ZERO, ..d.clone() }) {
-                        d.offset = n * px * 30.0;
-                    }
-                } else {
-                    d.offset = d.offset.normalize_or_zero() * px * 45.0;
+                if data.pair_dim_for(a, b, raw).is_none() {
+                    self.err("Those two cannot be dimensioned together (pick points, lines, circles or an axis).");
+                    self.reset_constraint_tool();
+                    return;
                 }
-                d
+                self.sketch.as_mut().unwrap().cons_second = Some(b);
+                self.say("Now click where the dimension goes. Right-click for the measure direction.");
             }
             (Some(a), _) => {
                 let i = match a {
@@ -886,33 +1016,112 @@ impl App {
                         return;
                     }
                 };
-                match data.single_dim_for(i, raw) {
-                    Some(d) => d,
+                match self.single_dim(&data, i, raw) {
+                    Some(d) => self.finish_dim(d),
                     None => {
                         self.err("That element has no single dimension; click a second item for a distance.");
-                        self.sketch.as_mut().unwrap().cons_first = None;
-                        return;
+                        self.reset_constraint_tool();
                     }
                 }
             }
-        };
-        // nothing it could move (only references, axes, origin): it just shows the value
-        let mut new_dim = new_dim;
-        if data.locked(&new_dim.a) && new_dim.b.map_or(true, |b| data.locked(&b)) {
-            new_dim.reference = true;
         }
+    }
+
+    fn reset_constraint_tool(&mut self) {
+        if let Some(sk) = self.sketch.as_mut() {
+            sk.cons_first = None;
+            sk.cons_second = None;
+            sk.cons_dir = MeasDir::Normal;
+            sk.cons_ref = false;
+            sk.cons_alt = false;
+        }
+    }
+
+    /// Adds a dimension made with the Constraint tool.
+    fn finish_dim(&mut self, mut d: Dim) {
+        let Some(data) = self.sketch_data().cloned() else { return };
+        // nothing it could move (only references, axes, origin): it just shows the value
+        if data.locked(&d.a) && d.b.map_or(true, |b| data.locked(&b)) || self.sketch.as_ref().unwrap().cons_ref {
+            d.reference = true;
+        }
+        let (name, label) = (d.kind.name(), d.label());
         self.checkpoint();
-        let name = new_dim.kind.name();
-        let label = new_dim.label();
         if let Some(sd) = self.sketch_data_mut() {
-            sd.dims.push(new_dim);
+            sd.dims.push(d);
         }
         let n = self.sketch_data().map(|d| d.dims.len()).unwrap_or(1);
-        let sk = self.sketch.as_mut().unwrap();
-        sk.cons_first = None;
-        sk.sel_dim = Some(n - 1);
+        self.reset_constraint_tool();
+        self.sketch.as_mut().unwrap().sel_dim = Some(n - 1);
         self.touch_sketch();
         self.say(&format!("{} constraint {} added. Double-click it to change the value; drag it to move it.", name, label));
+    }
+
+    /// Adds constraints and solves; when they cannot all hold, nothing changes.
+    pub fn add_constraints(&mut self, ds: Vec<Dim>) -> bool {
+        let Some(before) = self.sketch_data().cloned() else { return false };
+        if ds.is_empty() {
+            return false;
+        }
+        let names: Vec<&str> = ds.iter().map(|d| d.kind.name()).collect();
+        let msg = format!("{} created.", names.join(", "));
+        self.checkpoint();
+        let ok = match self.sketch_data_mut() {
+            Some(sd) => {
+                sd.dims.extend(ds);
+                sd.solve()
+            }
+            None => false,
+        };
+        if !ok {
+            if let Some(sd) = self.sketch_data_mut() {
+                *sd = before;
+            }
+            self.undo.pop();
+            self.err("That constraint cannot be satisfied with the others (the sketch would be inconsistent).");
+            return false;
+        }
+        self.touch_sketch();
+        self.say(&msg);
+        true
+    }
+
+    /// Picking items for Constraints Defined in Dialog Box / Contact Constraint.
+    fn pick_click(&mut self, raw: DVec2, px: f64, tool: SkTool) {
+        let Some((tmp, n)) = self.sketch_with_refs() else { return };
+        let Some(g) = self.pick_gref(&tmp, raw, px).map(|g| self.adopt_ref(&tmp, n, g)) else {
+            self.err("Click a point, an element or the H / V axis.");
+            return;
+        };
+        let sk = self.sketch.as_mut().unwrap();
+        if let Some(k) = sk.picks.iter().position(|p| *p == g) {
+            sk.picks.remove(k);
+            sk.dlg_kinds.clear();
+            return;
+        }
+        if tool == SkTool::Contact {
+            sk.picks.push(g);
+            if sk.picks.len() < 2 {
+                self.say("Contact Constraint: now click the second item.");
+                return;
+            }
+            let (a, b) = (sk.picks[0], sk.picks[1]);
+            sk.picks.clear();
+            let Some(data) = self.sketch_data().cloned() else { return };
+            let kind = data.contact_kind(&a, &b);
+            match data.make_constraint(kind, &[a, b]) {
+                Some(d) => {
+                    self.add_constraints(vec![d]);
+                }
+                None => self.err("Those two items cannot touch (pick points, lines, circles or arcs)."),
+            }
+        } else {
+            if sk.picks.len() >= 3 {
+                sk.picks.remove(0);
+            }
+            sk.picks.push(g);
+            sk.dlg_kinds.clear();
+            self.say("Tick the constraints to create on the right, then OK. Click more items (up to three), or a picked one again to drop it.");
+        }
     }
 
     /// Clicking, dragging and double-clicking dimension texts. Returns true when it used the input.
@@ -973,24 +1182,24 @@ impl App {
         self.ui.select_all = true;
     }
 
-    /// Sets a dimension's value and moves the geometry to match.
+    /// Sets a dimension's value and moves the geometry to match. When the sketch cannot reach
+    /// the value, nothing changes and false is returned.
     pub fn set_dim_value(&mut self, idx: usize, value: f64, reference: bool) -> bool {
         let fid = match self.sketch.as_ref() {
             Some(s) => s.feat,
             None => return false,
         };
         let ok = if let Some(sd) = self.sketch_data_mut() {
+            let before = sd.clone();
             if let Some(d) = sd.dims.get_mut(idx) {
                 d.value = value;
                 d.reference = reference;
             }
-            if reference {
-                if let Some(v) = sd.dims.get(idx).and_then(|d| sd.dim_measure(d)) {
-                    sd.dims[idx].value = v;
-                }
+            let ok = sd.solve_edit(idx);
+            if !ok {
+                *sd = before;
             }
-            sd.solve_dims(Some(idx));
-            sd.dims.iter().all(|d| sd.dim_ok(d))
+            ok
         } else {
             false
         };
@@ -1002,7 +1211,17 @@ impl App {
 
     /// Adds elements to the sketch being edited. Returns false if they were invalid.
     pub fn add_shapes(&mut self, shapes: Vec<Shape>, select: bool) -> bool {
+        self.add_shapes_as(shapes, select, false)
+    }
+
+    /// Adds elements like classic CAD draws them: a rectangle as four joined lines (with a
+    /// centre point when `centred`), a polygon or elongated hole as lines and arcs held by
+    /// constraints. With Geometrical Constraints on, SmartPick constraints are added too.
+    pub fn add_shapes_as(&mut self, shapes: Vec<Shape>, select: bool, centred: bool) -> bool {
         for s in &shapes {
+            if matches!(s, Shape::Point { .. }) {
+                continue;
+            }
             if s.is_open() {
                 let c = s.curve();
                 let len: f64 = c.windows(2).map(|w| (w[1] - w[0]).length()).sum();
@@ -1023,13 +1242,23 @@ impl App {
             }
         }
         self.checkpoint();
-        let constr = self.sketch.as_ref().map_or(false, |s| s.construction_mode);
+        let (constr, smart) = self.sketch.as_ref().map_or((false, true), |s| (s.construction_mode, s.auto_cons));
         let name = shapes.first().map(|s| s.kind_name()).unwrap_or("");
         let mut idx = Vec::new();
         if let Some(sd) = self.sketch_data_mut() {
             for s in shapes {
-                idx.push(sd.push(s, constr));
+                match s {
+                    Shape::Rect { cx, cy, w, h, .. } => {
+                        let (c, hv) = (DVec2::new(cx, cy), DVec2::new(w.abs(), h.abs()) * 0.5);
+                        idx.extend(sd.add_rectangle(c - hv, c + hv, centred, constr, smart));
+                    }
+                    Shape::Polygon { cx, cy, r, n, rot } => idx.extend(sd.add_polygon(DVec2::new(cx, cy), r.abs(), n.round() as usize, rot, constr, smart)),
+                    Shape::Slot { x1, y1, x2, y2, r } => idx.extend(sd.add_slot(DVec2::new(x1, y1), DVec2::new(x2, y2), r.abs(), constr, smart)),
+                    other => idx.push(if smart { sd.push(other, constr) } else { sd.push_raw(other, constr) }),
+                }
             }
+            // SmartPick constraints hold already; this just makes them exact
+            sd.solve();
         }
         if select {
             if let Some(sk) = self.sketch.as_mut() {
@@ -1038,7 +1267,7 @@ impl App {
         }
         self.touch_sketch();
         if select {
-            self.say(&format!("{} added. Type exact sizes on the right, keep drawing, or Exit Sketch.", name));
+            self.say(&format!("{} added. Dimension it with Constraint, keep drawing, or Exit Workbench.", name));
         }
         true
     }
@@ -1056,6 +1285,9 @@ impl App {
     }
 
     pub fn touch_sketch(&mut self) {
+        if let Some(sd) = self.sketch_data_mut() {
+            sd.refresh_refs();
+        }
         if let Some(id) = self.sketch.as_ref().map(|s| s.feat) {
             if let Some(p) = self.part_mut() {
                 p.touch_id(id);
@@ -1137,7 +1369,17 @@ impl App {
             measures: vec![],
             meas_first: None,
             keep_measures: false,
+            profile: vec![],
             cons_first: None,
+            cons_second: None,
+            cons_dir: MeasDir::Normal,
+            cons_ref: false,
+            cons_alt: false,
+            picks: vec![],
+            dlg_kinds: vec![],
+            auto_cons: true,
+            menu: None,
+            status: None,
             sel_dim: None,
             dim_rects: vec![],
             guides: vec![],
@@ -1188,7 +1430,22 @@ impl App {
 
     // ------------------------------------------------------------ drawing
 
+    /// The constraint status of the edited sketch (worked out again only when it changed).
+    pub fn sketch_status(&mut self) -> Option<SkStatus> {
+        let data = self.sketch_data()?.clone();
+        let sk = self.sketch.as_mut()?;
+        if let Some((s, d, st)) = &sk.status {
+            if *s == data.shapes && *d == data.dims {
+                return Some(st.clone());
+            }
+        }
+        let st = data.analyze();
+        sk.status = Some((data.shapes, data.dims, st.clone()));
+        Some(st)
+    }
+
     pub fn draw_sketch_2d(&mut self) {
+        let status = self.sketch_status();
         let f = match self.sketch_frame_world() {
             Some(f) => f,
             None => return,
@@ -1243,7 +1500,6 @@ impl App {
             text("V", o.x + 4.0, o.y - 60.0, 15, vcol);
         }
         // elements
-        let fixed_set = data.fixed_state(None).0;
         let hover = if sk.drag.is_none() && matches!(sk.tool, SkTool::Select | SkTool::Trim | SkTool::Mirror | SkTool::MeasureBetween | SkTool::MeasureItem | SkTool::Constraint) { self.sketch_hover_shape() } else { None };
         for (i, s) in data.shapes.iter().enumerate() {
             let sel = sk.sel.contains(&i);
@@ -1260,9 +1516,10 @@ impl App {
             } else if ext {
                 // a reference element from an earlier sketch (locked)
                 Color::new(1.0, 0.85, 0.20, 1.0)
-            } else if fixed_set.contains(&i) && !constr {
-                // fully fixed by its constraints (like a fully constrained element)
-                Color::new(0.30, 0.92, 0.40, 1.0)
+            } else if let Some(c) = status.as_ref().and_then(|st| st.elems.get(i)).and_then(|e| state_color(*e)) {
+                // classic CAD colours: green fully constrained, purple over-constrained,
+                // red inconsistent
+                c
             } else if is_axis {
                 Color::new(0.9, 0.85, 0.4, 1.0)
             } else if constr {
@@ -1273,6 +1530,13 @@ impl App {
             let c = s.curve();
             let sp: Vec<Vec2> = c.iter().filter_map(|p| to_s(*p)).collect();
             if sp.len() != c.len() || sp.is_empty() {
+                continue;
+            }
+            if let Shape::Point { .. } = s {
+                let p = sp[0];
+                let w = if sel { 2.5 } else { 1.5 };
+                draw_line(p.x - 5.0, p.y - 5.0, p.x + 5.0, p.y + 5.0, w, col);
+                draw_line(p.x - 5.0, p.y + 5.0, p.x + 5.0, p.y - 5.0, w, col);
                 continue;
             }
             let closed = !s.is_open();
@@ -1381,9 +1645,12 @@ impl App {
         if let Some(first) = &sk.meas_first {
             draw_item(first, mcol);
         }
-        if let Some(first) = &sk.cons_first {
-            let it = match *first {
-                GRef::Elem(i) => Some(MeasItem::Elem(i)),
+        for g in sk.cons_first.iter().chain(sk.cons_second.iter()).chain(sk.picks.iter()) {
+            let it = match *g {
+                GRef::Elem(i) => match data.shapes.get(i) {
+                    Some(Shape::Point { x, y }) => Some(MeasItem::Point(DVec2::new(*x, *y))),
+                    _ => Some(MeasItem::Elem(i)),
+                },
                 GRef::Key(i, k) => data.shapes.get(i).and_then(|s| s.key_points().get(k).copied()).map(MeasItem::Point),
                 GRef::AxisH => Some(MeasItem::AxisH),
                 GRef::AxisV => Some(MeasItem::AxisV),
@@ -1393,7 +1660,7 @@ impl App {
                 draw_item(&it, Color::new(0.45, 0.85, 1.0, 1.0));
             }
         }
-        if sk.tool == SkTool::Constraint && sk.cursor_ok && sk.drag.is_none() && !self.ui.over_ui() {
+        if matches!(sk.tool, SkTool::Constraint | SkTool::ConstraintDlg | SkTool::Contact) && sk.cursor_ok && sk.drag.is_none() && !self.ui.over_ui() {
             if let Some(it) = pick_item(&data, sk.raw, px * 8.0) {
                 draw_item(&it, Color::new(1.0, 0.8, 0.45, 1.0));
             }
@@ -1482,13 +1749,16 @@ fn arrow(tip: Vec2, along: Vec2, col: Color) {
 }
 
 impl App {
-    /// Draws the sketch's dimensions like classic CAD constraints: extension lines, a
-    /// dimension line with arrows and the value, which can be dragged and double-clicked.
+    /// Draws the sketch's constraints like classic CAD: dimensions with extension lines, a
+    /// dimension line with arrows and the value (dragged and double-clicked to edit), and
+    /// geometric constraints as small symbols. Green holds, purple over-constrains, red
+    /// cannot hold.
     pub fn draw_dims(&mut self) {
         let f = match self.sketch_frame_world() {
             Some(f) => f,
             None => return,
         };
+        let status = self.sketch_status();
         let data = match self.sketch_with_refs() {
             Some(d) => d.0,
             None => return,
@@ -1499,9 +1769,9 @@ impl App {
         let mut list: Vec<(Option<usize>, Dim)> = data.dims.iter().cloned().enumerate().map(|(i, d)| (Some(i), d)).collect();
         // preview of the dimension being placed
         if sk.tool == SkTool::Constraint && sk.cursor_ok && !self.ui.over_ui() {
-            if let Some(first) = sk.cons_first {
-                let under = self.pick_gref(&data, sk.raw, px);
-                let prev = match under {
+            let prev = match (sk.cons_first, sk.cons_second) {
+                (Some(a), Some(b)) => self.pending_dim(&data, a, b, sk.raw),
+                (Some(first), None) => match self.pick_gref(&data, sk.raw, px) {
                     Some(b) if b != first => data.pair_dim_for(first, b, sk.raw).map(|mut d| {
                         if d.kind != DimKind::Angle {
                             if let Some(DimGeom::Linear { n, .. }) = data.dim_geom(&Dim { offset: DVec2::ZERO, ..d.clone() }) {
@@ -1513,38 +1783,76 @@ impl App {
                         d
                     }),
                     _ => match first {
-                        GRef::Elem(i) => data.single_dim_for(i, sk.raw),
+                        GRef::Elem(i) => self.single_dim(&data, i, sk.raw),
                         _ => None,
                     },
-                };
-                if let Some(p) = prev {
-                    list.push((None, p));
-                }
+                },
+                _ => None,
+            };
+            if let Some(p) = prev {
+                list.push((None, p));
             }
         }
         let mut rects = Vec::new();
+        let mut tags: Vec<Vec2> = Vec::new();
         for (idx, d) in &list {
             let g = match data.dim_geom(d) {
                 Some(g) => g,
                 None => continue,
             };
-            let ok = data.dim_ok(d);
+            let state = idx.and_then(|i| status.as_ref().and_then(|s| s.dims.get(i).copied())).unwrap_or(CState::Iso);
             let selected = idx.is_some() && sk.sel_dim == *idx;
             let col = if idx.is_none() {
                 Color::new(0.45, 0.85, 1.0, 1.0)
             } else if selected {
                 C_SEL
-            } else if !ok {
-                Color::new(0.95, 0.35, 0.85, 1.0)
+            } else if let (Some(c), false) = (state_color(state).filter(|_| state != CState::Iso), d.reference) {
+                c
             } else if d.reference {
                 Color::new(0.7, 0.74, 0.8, 1.0)
             } else {
                 Color::new(0.35, 0.95, 0.5, 1.0)
             };
+            if let DimGeom::Tag { at, also } = &g {
+                let Some(mut sa) = to_s(*at) else { continue };
+                let small = d.kind == DimKind::Coincidence && d.b.is_some() && data.form(&d.a).map_or(false, |f| matches!(f, Form::Pt(_))) && data.form(d.b.as_ref().unwrap()).map_or(false, |f| matches!(f, Form::Pt(_)));
+                if small {
+                    // two points on top of each other: just a ring on the point
+                    draw_circle_lines(sa.x, sa.y, 3.5, 1.0, Color::new(col.r, col.g, col.b, 0.75));
+                    if let Some(i) = idx {
+                        rects.push((*i, Rect::new(sa.x - 5.0, sa.y - 5.0, 10.0, 10.0)));
+                    }
+                    continue;
+                }
+                // beside the geometry, out of the way of other symbols
+                sa += vec2(10.0, -12.0);
+                while tags.iter().any(|t| (*t - sa).length() < 15.0) {
+                    sa.x += 17.0;
+                }
+                tags.push(sa);
+                let rr = Rect::new(sa.x - 8.0, sa.y - 8.0, 16.0, 16.0);
+                draw_rectangle(rr.x, rr.y, rr.w, rr.h, Color::new(0.06, 0.07, 0.09, if selected { 0.95 } else { 0.7 }));
+                if selected {
+                    draw_rectangle_lines(rr.x, rr.y, rr.w, rr.h, 1.0, col);
+                }
+                draw_symbol(d.kind, sa, col);
+                if let Some(s2) = also.and_then(to_s) {
+                    let mut s2 = s2 + vec2(10.0, -12.0);
+                    while tags.iter().any(|t| (*t - s2).length() < 15.0) {
+                        s2.x += 17.0;
+                    }
+                    tags.push(s2);
+                    draw_rectangle(s2.x - 8.0, s2.y - 8.0, 16.0, 16.0, Color::new(0.06, 0.07, 0.09, 0.7));
+                    draw_symbol(d.kind, s2, col);
+                }
+                if let Some(i) = idx {
+                    rects.push((*i, rr));
+                }
+                continue;
+            }
             let text_at = match &g {
-                DimGeom::Linear { p, q, n, o, text } => {
-                    let (p2, q2) = (*p + *n * *o, *q + *n * *o);
-                    let (Some(sp), Some(sq), Some(sp2), Some(sq2), Some(st)) = (to_s(*p), to_s(*q), to_s(p2), to_s(q2), to_s(*text)) else { continue };
+                DimGeom::Linear { p, q, a, b, text, .. } => {
+                    let (Some(sp), Some(sq), Some(sp2), Some(sq2), Some(st)) = (to_s(*p), to_s(*q), to_s(*a), to_s(*b), to_s(*text)) else { continue };
                     // extension lines, a little past the dimension line
                     for (a, b) in [(sp, sp2), (sq, sq2)] {
                         let d = (b - a).normalize_or_zero();
@@ -1624,24 +1932,16 @@ impl App {
                     let Some(st) = to_s(*text) else { continue };
                     st
                 }
-                DimGeom::Tag { at } => {
-                    let Some(sa) = to_s(*at) else { continue };
-                    // just beside the line's middle
-                    sa + vec2(10.0, -12.0)
-                }
+                DimGeom::Tag { .. } => continue,
             };
             let label = d.label();
             let w = text_w(&label, 15) + 10.0;
-            let rr = if d.kind.is_geometric() { Rect::new(text_at.x - 7.0, text_at.y - 8.0, 14.0, 16.0) } else { Rect::new(text_at.x - w / 2.0, text_at.y - 10.0, w, 19.0) };
+            let rr = Rect::new(text_at.x - w / 2.0, text_at.y - 10.0, w, 19.0);
             draw_rectangle(rr.x, rr.y, rr.w, rr.h, Color::new(0.06, 0.07, 0.09, if selected { 0.95 } else { 0.78 }));
             if selected {
                 draw_rectangle_lines(rr.x, rr.y, rr.w, rr.h, 1.0, col);
             }
-            if d.kind.is_geometric() {
-                text(&label, rr.x + 3.0, rr.y + 12.0, 13, col);
-            } else {
-                text(&label, rr.x + 5.0, rr.y + 14.0, 15, col);
-            }
+            text(&label, rr.x + 5.0, rr.y + 14.0, 15, col);
             if let Some(i) = idx {
                 rects.push((*i, rr));
             }
@@ -1655,6 +1955,164 @@ impl App {
         if let Some(sk) = self.sketch.as_mut() {
             sk.dim_rects = rects;
         }
+    }
+
+    /// The right-click menu in the sketcher (options for the dimension being placed).
+    pub fn sketch_menu(&mut self, at: Vec2) {
+        let Some(data) = self.sketch_data().cloned() else { return };
+        let Some(sk) = self.sketch.as_ref() else { return };
+        let mut items: Vec<&'static str> = vec![];
+        if sk.tool == SkTool::Constraint {
+            match (sk.cons_first, sk.cons_second) {
+                (Some(a), Some(b)) => {
+                    if matches!((data.form(&a), data.form(&b)), (Some(Form::Pt(_)), Some(Form::Pt(_)))) {
+                        items.extend(["Horizontal Measure Direction", "Vertical Measure Direction", "Normal Measure Direction"]);
+                    }
+                }
+                (Some(GRef::Elem(i)), None) if matches!(data.shapes.get(i), Some(Shape::Circle { .. }) | Some(Shape::Arc { .. })) => items.push("Radius / Diameter"),
+                _ => {}
+            }
+            if sk.cons_first.is_some() {
+                items.extend(["Reference", "Cancel"]);
+            }
+        } else if let Some(i) = sk.sel_dim {
+            items.push(if data.dims.get(i).map_or(false, |d| d.kind.is_geometric()) { "Delete" } else { "Edit" });
+            if !items.contains(&"Delete") {
+                items.push("Delete");
+            }
+        } else if !sk.sel.is_empty() {
+            items.extend(["Fix", "Construction / Standard", "Delete"]);
+        }
+        if !items.is_empty() {
+            self.sketch.as_mut().unwrap().menu = Some((at, items));
+        }
+    }
+
+    pub fn draw_sketch_menu(&mut self) {
+        let Some((p, items)) = self.sketch.as_ref().and_then(|s| s.menu.clone()) else { return };
+        let w = 240.0;
+        let r = Rect::new(p.x, p.y, w, items.len() as f32 * 24.0 + 6.0);
+        self.ui.panel(r, None);
+        let (dir, rf, alt) = {
+            let sk = self.sketch.as_ref().unwrap();
+            (sk.cons_dir, sk.cons_ref, sk.cons_alt)
+        };
+        let mut chosen = None;
+        for (i, it) in items.iter().enumerate() {
+            let rr = Rect::new(r.x + 2.0, r.y + 3.0 + i as f32 * 24.0, w - 4.0, 24.0);
+            self.ui.reg(&format!("skm_{}", it), rr);
+            if self.ui.hover(rr) {
+                draw_rectangle(rr.x, rr.y, rr.w, rr.h, C_HOT);
+            }
+            let on = match *it {
+                "Horizontal Measure Direction" => dir == MeasDir::Horizontal,
+                "Vertical Measure Direction" => dir == MeasDir::Vertical,
+                "Normal Measure Direction" => dir == MeasDir::Normal,
+                "Reference" => rf,
+                "Radius / Diameter" => alt,
+                _ => false,
+            };
+            if on {
+                text("*", rr.x + 6.0, rr.y + 18.0, 16, C_SEL);
+            }
+            text(it, rr.x + 18.0, rr.y + 17.0, 16, C_TEXT);
+            if self.ui.clicked(rr) {
+                chosen = Some(*it);
+            }
+        }
+        if let Some(c) = chosen {
+            self.sketch.as_mut().unwrap().menu = None;
+            match c {
+                "Horizontal Measure Direction" => self.sketch.as_mut().unwrap().cons_dir = MeasDir::Horizontal,
+                "Vertical Measure Direction" => self.sketch.as_mut().unwrap().cons_dir = MeasDir::Vertical,
+                "Normal Measure Direction" => self.sketch.as_mut().unwrap().cons_dir = MeasDir::Normal,
+                "Reference" => {
+                    let sk = self.sketch.as_mut().unwrap();
+                    sk.cons_ref = !sk.cons_ref;
+                }
+                "Radius / Diameter" => {
+                    let sk = self.sketch.as_mut().unwrap();
+                    sk.cons_alt = !sk.cons_alt;
+                }
+                "Cancel" => self.reset_constraint_tool(),
+                "Edit" => {
+                    if let Some(i) = self.sketch.as_ref().unwrap().sel_dim {
+                        self.open_dim_dialog(i);
+                    }
+                }
+                "Delete" => self.delete_sketch_selection(),
+                "Construction / Standard" => self.toggle_construction(),
+                "Fix" => {
+                    let sel = self.sketch.as_ref().unwrap().sel.clone();
+                    let ds: Vec<Dim> = match self.sketch_data() {
+                        Some(d) => sel.iter().filter_map(|i| d.make_constraint(DimKind::Fix, &[GRef::Elem(*i)])).collect(),
+                        None => vec![],
+                    };
+                    self.add_constraints(ds);
+                }
+                _ => {}
+            }
+        } else if (self.ui.inp.pressed[LMB] || self.ui.inp.pressed[RMB]) && !r.contains(self.ui.inp.mouse) {
+            self.sketch.as_mut().unwrap().menu = None;
+        }
+    }
+}
+
+/// Classic CAD constraint colours (None: the normal colour).
+pub fn state_color(s: CState) -> Option<Color> {
+    match s {
+        CState::Under => None,
+        CState::Iso => Some(Color::new(0.30, 0.92, 0.40, 1.0)),
+        CState::Over => Some(Color::new(0.85, 0.40, 1.0, 1.0)),
+        CState::Bad => Some(Color::new(1.0, 0.25, 0.20, 1.0)),
+    }
+}
+
+/// The small symbol of a geometric constraint, centred on `c`.
+fn draw_symbol(kind: DimKind, c: Vec2, col: Color) {
+    let l = |a: Vec2, b: Vec2| draw_line(c.x + a.x, c.y + a.y, c.x + b.x, c.y + b.y, 1.5, col);
+    match kind {
+        DimKind::Horizontal => text("H", c.x - 4.5, c.y + 5.0, 14, col),
+        DimKind::Vertical => text("V", c.x - 4.5, c.y + 5.0, 14, col),
+        DimKind::Parallel => {
+            l(vec2(-4.0, 5.0), vec2(0.0, -5.0));
+            l(vec2(1.0, 5.0), vec2(5.0, -5.0));
+        }
+        DimKind::Perpendicular => {
+            l(vec2(-5.0, 5.0), vec2(5.0, 5.0));
+            l(vec2(0.0, 5.0), vec2(0.0, -5.0));
+        }
+        DimKind::Tangent => {
+            draw_circle_lines(c.x, c.y + 1.0, 4.0, 1.2, col);
+            l(vec2(-6.0, -4.0), vec2(6.0, -4.0));
+        }
+        DimKind::Concentric => {
+            draw_circle_lines(c.x, c.y, 2.0, 1.2, col);
+            draw_circle_lines(c.x, c.y, 5.5, 1.2, col);
+        }
+        DimKind::Coincidence => draw_circle_lines(c.x, c.y, 4.0, 1.5, col),
+        DimKind::Midpoint => {
+            l(vec2(-6.0, 2.0), vec2(6.0, 2.0));
+            l(vec2(0.0, -4.0), vec2(0.0, 6.0));
+        }
+        DimKind::Equidistant => {
+            l(vec2(-5.0, -2.0), vec2(5.0, -2.0));
+            l(vec2(-5.0, 2.0), vec2(5.0, 2.0));
+        }
+        DimKind::Symmetry => {
+            l(vec2(0.0, -6.0), vec2(0.0, 6.0));
+            draw_triangle(c + vec2(-2.0, 0.0), c + vec2(-6.0, -3.0), c + vec2(-6.0, 3.0), col);
+            draw_triangle(c + vec2(2.0, 0.0), c + vec2(6.0, -3.0), c + vec2(6.0, 3.0), col);
+        }
+        DimKind::Fix => {
+            // an anchor
+            draw_circle_lines(c.x, c.y - 4.5, 1.8, 1.2, col);
+            l(vec2(0.0, -2.5), vec2(0.0, 5.5));
+            l(vec2(-3.0, -0.5), vec2(3.0, -0.5));
+            l(vec2(-5.0, 2.5), vec2(0.0, 5.5));
+            l(vec2(5.0, 2.5), vec2(0.0, 5.5));
+        }
+        _ => {}
     }
 }
 
