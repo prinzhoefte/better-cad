@@ -569,6 +569,14 @@ impl SelfTest {
                 c.matrix().transform_point3(DVec3::new(-4.0, -4.0, 20.0))
             }),
             Wait(5),
+            Check("update needed", |a| {
+                let pr = a.product().unwrap();
+                let waits = pr.needs_update() && pr.constraints.len() == 1;
+                (waits, format!("the new constraint waits for Update, like classic CAD (update needed: {})", pr.needs_update()))
+            }),
+            ClickId("con_close"),
+            ClickId("as_update"),
+            Wait(5),
             Check("assemble", |a| {
                 let pr = match a.product() {
                     Some(p) => p,

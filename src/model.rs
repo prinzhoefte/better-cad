@@ -884,18 +884,68 @@ fn rebuild(feats: &[Feature], start: usize, cache: &mut PartCache) {
 
 // ---------------------------------------------------------------- assemblies
 
+/// A face an assembly constraint is attached to, in the part's own coordinates: a flat face
+/// (a point on it and its normal) or a round one (its axis and radius).
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq)]
 #[serde(tag = "type")]
 pub enum GeomRef {
     Plane { p: DVec3, n: DVec3 },
-    Axis { p: DVec3, d: DVec3 },
+    Axis {
+        p: DVec3,
+        d: DVec3,
+        #[serde(default)]
+        r: f64,
+    },
 }
 
 impl GeomRef {
     pub fn transformed(&self, m: &DMat4) -> GeomRef {
         match self {
             GeomRef::Plane { p, n } => GeomRef::Plane { p: m.transform_point3(*p), n: m.transform_vector3(*n).normalize() },
-            GeomRef::Axis { p, d } => GeomRef::Axis { p: m.transform_point3(*p), d: m.transform_vector3(*d).normalize() },
+            GeomRef::Axis { p, d, r } => GeomRef::Axis { p: m.transform_point3(*p), d: m.transform_vector3(*d).normalize(), r: *r },
+        }
+    }
+
+    /// The same face found again on the part's current geometry (it may have moved or grown
+    /// since the constraint was made): the flat face with the same normal nearest to where it
+    /// was, or the round face with the same axis direction nearest to the old axis.
+    pub fn rematch(&self, m: &Mesh) -> Option<GeomRef> {
+        match *self {
+            GeomRef::Plane { p, n } => {
+                let mut seen = std::collections::HashSet::new();
+                let mut best: Option<(f64, GeomRef)> = None;
+                for t in 0..m.tris.len() {
+                    if !seen.insert(m.face[t]) || m.tri_normal[t].dot(n) < 0.9999 {
+                        continue;
+                    }
+                    let (c, nn) = m.face_plane(t);
+                    let d = (c - p).length();
+                    if best.map_or(true, |b| d < b.0) {
+                        best = Some((d, GeomRef::Plane { p: c, n: nn }));
+                    }
+                }
+                best.map(|b| b.1)
+            }
+            GeomRef::Axis { p, d, r } => {
+                let mut seen = std::collections::HashSet::new();
+                let mut best: Option<(f64, GeomRef)> = None;
+                for t in 0..m.tris.len() {
+                    if !seen.insert(m.smooth[t]) {
+                        continue;
+                    }
+                    let Some((q, e, rr)) = m.face_axis(t) else { continue };
+                    if e.dot(d).abs() < 0.9999 {
+                        continue;
+                    }
+                    let w = q - p;
+                    let off = (w - d * w.dot(d)).length() + (rr - r).abs();
+                    if best.map_or(true, |b| off < b.0) {
+                        let e = if e.dot(d) < 0.0 { -e } else { e };
+                        best = Some((off, GeomRef::Axis { p: q, d: e, r: rr }));
+                    }
+                }
+                best.map(|b| b.1)
+            }
         }
     }
 }
@@ -906,6 +956,10 @@ pub enum CKind {
     Offset,
     Coincidence,
     Angle,
+    Parallel,
+    Perpendicular,
+    /// two components move as one
+    FixTogether,
 }
 
 impl CKind {
@@ -915,6 +969,9 @@ impl CKind {
             CKind::Offset => "Offset",
             CKind::Coincidence => "Coincidence",
             CKind::Angle => "Angle",
+            CKind::Parallel => "Parallelism",
+            CKind::Perpendicular => "Perpendicularity",
+            CKind::FixTogether => "Fix Together",
         }
     }
 }
@@ -930,6 +987,9 @@ pub struct Constraint {
     pub value: f64,
     #[serde(default)]
     pub flip: bool,
+    /// Fix Together: where component a sits relative to component b
+    #[serde(default)]
+    pub rel: Option<(DVec3, DQuat)>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -955,6 +1015,9 @@ pub struct Product {
     pub name: String,
     pub comps: Vec<Component>,
     pub constraints: Vec<Constraint>,
+    /// constraints the last update could not satisfy
+    #[serde(skip)]
+    pub broken: Vec<usize>,
     pub next_id: u32,
     pub counters: HashMap<String, u32>,
 }
@@ -994,7 +1057,7 @@ pub const SWATCHES: [[f32; 3]; 16] = [
 
 impl Product {
     pub fn new(name: &str) -> Product {
-        Product { name: name.into(), comps: vec![], constraints: vec![], next_id: 1, counters: HashMap::new() }
+        Product { name: name.into(), comps: vec![], constraints: vec![], broken: vec![], next_id: 1, counters: HashMap::new() }
     }
     pub fn add_component(&mut self, mut part: Part, pos: DVec3) -> u32 {
         let id = self.next_id;
@@ -1023,30 +1086,83 @@ impl Product {
         self.constraints.retain(|c| c.a != id && c.b != id);
     }
 
-    /// Moves components until the constraints hold (fixed components never move).
+    /// Is any constraint not satisfied (classic CAD shows "update needed")?
+    pub fn needs_update(&self) -> bool {
+        self.constraints.iter().any(|c| match (self.comp(c.a), self.comp(c.b)) {
+            (Some(a), Some(b)) => !(a.fixed && b.fixed) && constraint_error(c, a, b) > 1e-3,
+            _ => false,
+        })
+    }
+
+    /// Classic CAD's Update: the constraints find their faces again on the parts' current
+    /// geometry, then components move until the constraints hold (fixed ones never move).
+    /// Returns the constraints that cannot be satisfied.
     pub fn solve(&mut self) -> Vec<String> {
-        let mut problems = Vec::new();
-        for _ in 0..30 {
+        for ci in 0..self.constraints.len() {
+            let c = self.constraints[ci].clone();
+            for (id, r, second) in [(c.a, c.ra, false), (c.b, c.rb, true)] {
+                let m = self.comp(id).and_then(|x| x.part.cache.mesh.clone());
+                if let Some(nr) = m.and_then(|m| r.rematch(&m)) {
+                    if second {
+                        self.constraints[ci].rb = nr;
+                    } else {
+                        self.constraints[ci].ra = nr;
+                    }
+                }
+            }
+        }
+        let err = |pr: &Product| -> f64 {
+            pr.constraints
+                .iter()
+                .filter_map(|c| match (pr.comp(c.a), pr.comp(c.b)) {
+                    (Some(a), Some(b)) if !(a.fixed && b.fixed) => Some(constraint_error(c, a, b)),
+                    _ => None,
+                })
+                .fold(0.0, f64::max)
+        };
+        for _ in 0..300 {
             for ci in 0..self.constraints.len() {
                 let c = self.constraints[ci].clone();
                 let (fa, fb) = match (self.comp(c.a), self.comp(c.b)) {
                     (Some(a), Some(b)) => (a.fixed, b.fixed),
                     _ => continue,
                 };
+                if c.kind == CKind::FixTogether {
+                    let Some((rp, rq)) = c.rel else { continue };
+                    let (pa, qa, pb, qb) = {
+                        let (a, b) = (self.comp(c.a).unwrap(), self.comp(c.b).unwrap());
+                        (a.pos, a.rot, b.pos, b.rot)
+                    };
+                    if !fa {
+                        let m = self.comp_mut(c.a).unwrap();
+                        m.rot = (qb * rq).normalize();
+                        m.pos = pb + qb * rp;
+                    } else if !fb {
+                        let m = self.comp_mut(c.b).unwrap();
+                        m.rot = (qa * rq.inverse()).normalize();
+                        m.pos = pa - m.rot * rp;
+                    }
+                    continue;
+                }
                 let (mover, mref, other, oref) = if !fa { (c.a, c.ra, c.b, c.rb) } else if !fb { (c.b, c.rb, c.a, c.ra) } else { continue };
                 let target = oref.transformed(&self.comp(other).unwrap().matrix());
                 let comp = self.comp_mut(mover).unwrap();
                 apply_constraint(comp, c.kind, mref, target, c.value, c.flip);
             }
+            if err(self) < 1e-9 {
+                break;
+            }
         }
-        for c in &self.constraints {
+        let mut problems = Vec::new();
+        self.broken.clear();
+        for (i, c) in self.constraints.iter().enumerate() {
             if let (Some(a), Some(b)) = (self.comp(c.a), self.comp(c.b)) {
                 if a.fixed && b.fixed {
                     continue;
                 }
-                let err = constraint_error(c, a, b);
-                if err > 1e-3 {
-                    problems.push(format!("{} cannot be fully satisfied", c.name));
+                if constraint_error(c, a, b) > 1e-3 {
+                    problems.push(format!("{} cannot be satisfied", c.name));
+                    self.broken.push(i);
                 }
             }
         }
@@ -1071,54 +1187,137 @@ fn rotate_about(comp: &mut Component, q: DQuat, pivot: DVec3) {
     comp.rot = (q * comp.rot).normalize();
 }
 
+/// Turns `comp` about `pivot` so that direction `from` (world) becomes `to`.
+fn turn(comp: &mut Component, from: DVec3, to: DVec3, pivot: DVec3) {
+    let q = shortest_arc(from, to, to.any_orthonormal_vector());
+    rotate_about(comp, q, pivot);
+}
+
+/// `v` made square to `n` (or any direction square to `n` when `v` is along it).
+fn square_to(v: DVec3, n: DVec3) -> DVec3 {
+    let w = v - n * v.dot(n);
+    if w.length() < 1e-9 { n.any_orthonormal_vector() } else { w.normalize() }
+}
+
+/// Moves component `comp` (its face `local`) so that the constraint with `target` (world)
+/// holds.
 fn apply_constraint(comp: &mut Component, kind: CKind, local: GeomRef, target: GeomRef, value: f64, flip: bool) {
     let world = local.transformed(&comp.matrix());
     match (kind, world, target) {
         (CKind::Contact | CKind::Offset, GeomRef::Plane { p, n }, GeomRef::Plane { p: tp, n: tn }) => {
             let want = if flip { tn } else { -tn };
-            let q = shortest_arc(n, want, tn.any_orthonormal_vector());
-            rotate_about(comp, q, p);
+            turn(comp, n, want, p);
             let off = if kind == CKind::Offset { value } else { 0.0 };
             let dist = (p - tp).dot(tn);
             comp.pos += tn * (off - dist);
         }
-        (CKind::Coincidence, GeomRef::Axis { p, d }, GeomRef::Axis { p: tp, d: td }) => {
-            let want = if (d.dot(td) >= 0.0) != flip { td } else { -td };
-            let q = shortest_arc(d, want, td.any_orthonormal_vector());
-            rotate_about(comp, q, p);
-            let w = p - tp;
-            let perp = w - td * w.dot(td);
-            comp.pos -= perp;
+        // planes in one plane (same way round unless flipped)
+        (CKind::Coincidence, GeomRef::Plane { p, n }, GeomRef::Plane { p: tp, n: tn }) => {
+            let want = if flip { -tn } else { tn };
+            turn(comp, n, want, p);
+            comp.pos -= tn * (p - tp).dot(tn);
         }
-        (CKind::Angle, GeomRef::Plane { p, n }, GeomRef::Plane { n: tn, .. }) => {
-            // rotate n about the axis perpendicular to both so that angle(n, tn) = value
-            let cur = n.dot(tn).clamp(-1.0, 1.0).acos();
-            let mut ax = n.cross(tn);
-            if ax.length() < 1e-9 {
-                ax = tn.any_orthonormal_vector();
+        (CKind::Coincidence | CKind::Contact, GeomRef::Axis { p, d, .. }, GeomRef::Axis { p: tp, d: td, .. }) => {
+            let want = if (d.dot(td) >= 0.0) != flip { td } else { -td };
+            turn(comp, d, want, p);
+            let w = p - tp;
+            comp.pos -= w - td * w.dot(td);
+        }
+        // an axis lying in a plane / a plane through an axis
+        (CKind::Coincidence, GeomRef::Axis { p, d, .. }, GeomRef::Plane { p: tp, n: tn }) => {
+            turn(comp, d, square_to(d, tn), p);
+            comp.pos -= tn * (p - tp).dot(tn);
+        }
+        (CKind::Coincidence, GeomRef::Plane { p, n }, GeomRef::Axis { p: tp, d: td, .. }) => {
+            turn(comp, n, square_to(n, td), p);
+            let n2 = square_to(n, td);
+            comp.pos += n2 * (tp - p).dot(n2);
+        }
+        // a cylinder lying on a flat face (line contact)
+        (CKind::Contact, GeomRef::Axis { p, d, r }, GeomRef::Plane { p: tp, n: tn }) => {
+            turn(comp, d, square_to(d, tn), p);
+            let side = if flip { -1.0 } else { 1.0 };
+            comp.pos += tn * (side * r - (p - tp).dot(tn));
+        }
+        (CKind::Contact, GeomRef::Plane { p, n }, GeomRef::Axis { p: tp, d: td, r }) => {
+            let n2 = square_to(n, td);
+            turn(comp, n, n2, p);
+            let side = if flip { -1.0 } else { 1.0 };
+            comp.pos += n2 * ((tp - p).dot(n2) - side * r);
+        }
+        (CKind::Angle | CKind::Parallel | CKind::Perpendicular, a, b) => {
+            let dir = |g: GeomRef| match g {
+                GeomRef::Plane { n, .. } => n,
+                GeomRef::Axis { d, .. } => d,
+            };
+            let (n, tn) = (dir(a), dir(b));
+            let p = match a {
+                GeomRef::Plane { p, .. } | GeomRef::Axis { p, .. } => p,
+            };
+            match kind {
+                CKind::Parallel => {
+                    let want = if (n.dot(tn) >= 0.0) != flip { tn } else { -tn };
+                    turn(comp, n, want, p);
+                }
+                CKind::Perpendicular => turn(comp, n, square_to(n, tn), p),
+                _ => {
+                    // rotate n about the axis square to both so that angle(n, tn) = value
+                    let cur = n.dot(tn).clamp(-1.0, 1.0).acos();
+                    let mut ax = n.cross(tn);
+                    if ax.length() < 1e-9 {
+                        ax = tn.any_orthonormal_vector();
+                    }
+                    let delta = cur - value.to_radians();
+                    rotate_about(comp, DQuat::from_axis_angle(ax.normalize(), delta), p);
+                }
             }
-            let delta = cur - value.to_radians();
-            rotate_about(comp, DQuat::from_axis_angle(ax.normalize(), delta), p);
         }
         _ => {}
     }
 }
 
+/// How far a constraint is from holding (0 when it holds).
 pub fn constraint_error(c: &Constraint, a: &Component, b: &Component) -> f64 {
+    if c.kind == CKind::FixTogether {
+        let Some((rp, rq)) = c.rel else { return 0.0 };
+        let (wp, wq) = (b.pos + b.rot * rp, b.rot * rq);
+        return (a.pos - wp).length() + a.rot.angle_between(wq) * 10.0;
+    }
     let wa = c.ra.transformed(&a.matrix());
     let wb = c.rb.transformed(&b.matrix());
+    let dir = |g: GeomRef| match g {
+        GeomRef::Plane { n, .. } => n,
+        GeomRef::Axis { d, .. } => d,
+    };
     match (c.kind, wa, wb) {
         (CKind::Contact | CKind::Offset, GeomRef::Plane { p, n }, GeomRef::Plane { p: tp, n: tn }) => {
             let off = if c.kind == CKind::Offset { c.value } else { 0.0 };
             let want = if c.flip { 1.0 } else { -1.0 };
             (n.dot(tn) - want).abs() + ((p - tp).dot(tn) - off).abs()
         }
-        (CKind::Coincidence, GeomRef::Axis { p, d }, GeomRef::Axis { p: tp, d: td }) => {
+        (CKind::Coincidence, GeomRef::Plane { p, n }, GeomRef::Plane { p: tp, n: tn }) => {
+            let want = if c.flip { -1.0 } else { 1.0 };
+            (n.dot(tn) - want).abs() + (p - tp).dot(tn).abs()
+        }
+        (CKind::Coincidence | CKind::Contact, GeomRef::Axis { p, d, .. }, GeomRef::Axis { p: tp, d: td, .. }) => {
             let w = p - tp;
             (1.0 - d.dot(td).abs()) + (w - td * w.dot(td)).length()
         }
-        (CKind::Angle, GeomRef::Plane { n, .. }, GeomRef::Plane { n: tn, .. }) => (n.dot(tn).clamp(-1.0, 1.0).acos().to_degrees() - c.value).abs() * 0.01,
-        _ => 0.0,
+        (CKind::Coincidence, GeomRef::Axis { p, d, .. }, GeomRef::Plane { p: tp, n: tn }) => d.dot(tn).abs() + (p - tp).dot(tn).abs(),
+        (CKind::Coincidence, GeomRef::Plane { p, n }, GeomRef::Axis { p: tp, d: td, .. }) => n.dot(td).abs() + (tp - p).dot(n).abs(),
+        (CKind::Contact, GeomRef::Axis { p, d, r }, GeomRef::Plane { p: tp, n: tn }) => {
+            let side = if c.flip { -1.0 } else { 1.0 };
+            d.dot(tn).abs() + ((p - tp).dot(tn) - side * r).abs()
+        }
+        (CKind::Contact, GeomRef::Plane { p, n }, GeomRef::Axis { p: tp, d: td, r }) => {
+            let side = if c.flip { -1.0 } else { 1.0 };
+            n.dot(td).abs() + ((tp - p).dot(n) - side * r).abs()
+        }
+        (CKind::Angle, x, y) => (dir(x).dot(dir(y)).clamp(-1.0, 1.0).acos().to_degrees() - c.value).abs() * 0.01,
+        (CKind::Parallel, x, y) => 1.0 - dir(x).dot(dir(y)).abs(),
+        (CKind::Perpendicular, x, y) => dir(x).dot(dir(y)).abs(),
+        // a pairing that makes no sense never holds
+        _ => 1.0,
     }
 }
 
@@ -1218,11 +1417,62 @@ mod tests {
             rb: GeomRef::Plane { p: DVec3::new(0.0, 0.0, 5.0), n: DVec3::Z },
             value: 0.0,
             flip: false,
+            rel: None,
         });
+        assert!(pr.needs_update(), "a new constraint waits for Update");
         let probs = pr.solve();
         assert!(probs.is_empty());
         let c = pr.comp(b).unwrap();
         assert!((c.pos.z - 10.0).abs() < 1e-9, "{:?}", c.pos);
+    }
+
+    #[test]
+    fn assembly_constraints_like_classic_cad() {
+        let boxed = |name: &str, h: f64| {
+            let mut p = Part::new(name);
+            p.add_feature(FeatureKind::Primitive { prim: PrimKind::Box, pos: DVec3::ZERO, a: 10.0, b: 10.0, c: h, axis: Axis3::Z, subtract: false });
+            p.mesh();
+            p
+        };
+        let mut pr = Product::new("A");
+        let a = pr.add_component(boxed("A", 10.0), DVec3::ZERO);
+        let b = pr.add_component(boxed("B", 10.0), DVec3::new(30.0, 5.0, 3.0));
+        let c = pr.add_component(boxed("C", 10.0), DVec3::new(50.0, 0.0, 0.0));
+        pr.comp_mut(a).unwrap().fixed = true;
+        pr.comp_mut(b).unwrap().rot = DQuat::from_rotation_x(0.3);
+        let top = GeomRef::Plane { p: DVec3::new(0.0, 0.0, 5.0), n: DVec3::Z };
+        let mk = |name: &str, kind, a, ra, b, rb| Constraint { name: name.into(), kind, a, ra, b, rb, value: 0.0, flip: false, rel: None };
+        // B's top face in the plane of A's top face
+        pr.constraints.push(mk("Coincidence.1", CKind::Coincidence, b, top, a, top));
+        // C rides along with B
+        let (cb, cc) = (pr.comp(b).unwrap().clone(), pr.comp(c).unwrap().clone());
+        let mut ft = mk("Fix Together.1", CKind::FixTogether, c, top, b, top);
+        ft.rel = Some((cb.rot.inverse() * (cc.pos - cb.pos), (cb.rot.inverse() * cc.rot).normalize()));
+        pr.constraints.push(ft);
+        assert!(pr.needs_update(), "constraints wait for Update");
+        assert!(pr.solve().is_empty());
+        assert!(!pr.needs_update());
+        let (pb, pc) = (pr.comp(b).unwrap().clone(), pr.comp(c).unwrap().clone());
+        assert!(pb.pos.z.abs() < 1e-6 && pb.rot.angle_between(DQuat::IDENTITY) < 1e-6, "{:?}", pb.pos);
+        let rel = cb.rot.inverse() * DVec3::new(20.0, -5.0, -3.0);
+        assert!((pc.pos - pb.pos - pb.rot * rel).length() < 1e-6 && pc.rot.angle_between(pb.rot * cb.rot.inverse() * cc.rot) < 1e-6, "C keeps its place relative to B");
+        // A grows: the constraint finds A's top face again (now 5 mm higher) on Update
+        if let FeatureKind::Primitive { c: h, .. } = &mut pr.comp_mut(a).unwrap().part.features[0].kind {
+            *h = 20.0;
+        }
+        {
+            let pa = &mut pr.comp_mut(a).unwrap().part;
+            pa.touch(0);
+            pa.mesh();
+        }
+        assert!(pr.solve().is_empty());
+        assert!((pr.comp(b).unwrap().pos.z - 5.0).abs() < 1e-6, "{:?}", pr.comp(b).unwrap().pos);
+        // perpendicular faces, and an impossible pair reported
+        pr.constraints.push(mk("Perpendicularity.1", CKind::Perpendicular, b, GeomRef::Plane { p: DVec3::new(5.0, 0.0, 0.0), n: DVec3::X }, a, top));
+        assert!(pr.solve().is_empty());
+        pr.constraints.push(mk("Parallelism.1", CKind::Parallel, b, GeomRef::Plane { p: DVec3::new(5.0, 0.0, 0.0), n: DVec3::X }, a, top));
+        let probs = pr.solve();
+        assert!(!probs.is_empty() && !pr.broken.is_empty(), "parallel and perpendicular at once cannot hold");
     }
 
     #[test]

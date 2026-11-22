@@ -507,7 +507,7 @@ impl App {
                 let k = self.view.px_size(p.as_vec3()) as f64 * 40.0;
                 draw_line_3d(p.as_vec3(), (p + n * k).as_vec3(), col);
             }
-            GeomRef::Axis { p, d } => {
+            GeomRef::Axis { p, d, .. } => {
                 let k = self.view.px_size(p.as_vec3()) as f64 * 80.0;
                 draw_line_3d((p - d * k).as_vec3(), (p + d * k).as_vec3(), col);
             }
@@ -1467,12 +1467,9 @@ impl App {
                     self.drag_gizmo(g, inp.mouse, inp.ctrl);
                 } else {
                     self.gizmo_drag = None;
-                    if let Some(pr) = self.product_mut() {
-                        let probs = pr.solve();
-                        if !probs.is_empty() {
-                            let m = probs.join("; ");
-                            self.err(&m);
-                        }
+                    // like classic CAD, constraints wait for Update
+                    if self.product().map_or(false, |p| p.needs_update()) {
+                        self.say("Moved. The constraints are not up to date: Update (Ctrl+U) puts the parts back where they hold.");
                     }
                 }
                 return;
@@ -1610,17 +1607,14 @@ impl App {
                         Some(c) => c,
                         None => return,
                     };
-                    let r = if kind == CKind::Coincidence {
-                        match h.mesh.face_axis(h.tri) {
-                            Some((p, d, _)) => GeomRef::Axis { p, d },
-                            None => {
-                                self.err("Coincidence needs a round face (a hole or a pin). Click a curved surface.");
-                                return;
-                            }
+                    // a round face gives its axis, a flat face its plane
+                    let axis = h.mesh.face_axis(h.tri).filter(|_| !matches!(kind, CKind::Offset | CKind::FixTogether));
+                    let r = match axis {
+                        Some((p, d, r)) => GeomRef::Axis { p, d, r },
+                        None => {
+                            let (p, n) = h.mesh.face_plane(h.tri);
+                            GeomRef::Plane { p, n }
                         }
-                    } else {
-                        let (p, n) = h.mesh.face_plane(h.tri);
-                        GeomRef::Plane { p, n }
                     };
                     match first {
                         None => {
@@ -1689,36 +1683,64 @@ impl App {
     }
 
     pub fn add_constraint(&mut self, kind: CKind, a: u32, ra: GeomRef, b: u32, rb: GeomRef) {
+        let (ca, cb) = match self.product().map(|pr| (pr.comp(a).cloned(), pr.comp(b).cloned())) {
+            Some((Some(x), Some(y))) => (x, y),
+            _ => return,
+        };
+        let wa = ra.transformed(&ca.matrix());
+        let wb = rb.transformed(&cb.matrix());
+        let dir = |g: GeomRef| match g {
+            GeomRef::Plane { n, .. } => n,
+            GeomRef::Axis { d, .. } => d,
+        };
+        // the pairs of faces each constraint accepts
+        let fits = match (kind, wa, wb) {
+            (CKind::Offset, GeomRef::Plane { .. }, GeomRef::Plane { .. }) => true,
+            (CKind::Offset, ..) => false,
+            (CKind::Contact, GeomRef::Axis { .. }, GeomRef::Axis { .. }) => true,
+            (CKind::Contact, GeomRef::Axis { r, .. }, GeomRef::Plane { .. }) | (CKind::Contact, GeomRef::Plane { .. }, GeomRef::Axis { r, .. }) => r > 1e-6,
+            _ => true,
+        };
+        if !fits {
+            self.err(&format!("{} does not fit those faces (pick flat faces{}).", kind.name(), if kind == CKind::Contact { ", or a round face and a flat one" } else { "" }));
+            self.tool = Tool::Constrain(kind, None);
+            return;
+        }
         self.checkpoint();
         let pr = self.product_mut().unwrap();
         let name = pr.next_name(kind.name());
-        // offset and angle start from the current value
-        let (ca, cb) = (pr.comp(a).unwrap(), pr.comp(b).unwrap());
-        let wa = ra.transformed(&ca.matrix());
-        let wb = rb.transformed(&cb.matrix());
+        // offset and angle start from the current value; the orientation from how they lie now
         let value = match (kind, wa, wb) {
             (CKind::Offset, GeomRef::Plane { p, .. }, GeomRef::Plane { p: tp, n: tn }) => {
                 let v = (p - tp).dot(tn);
                 if v.abs() < 1e-6 { 10.0 } else { (v * 100.0).round() / 100.0 }
             }
-            (CKind::Angle, GeomRef::Plane { n, .. }, GeomRef::Plane { n: tn, .. }) => (n.dot(tn).clamp(-1.0, 1.0).acos().to_degrees()).round(),
+            (CKind::Angle, x, y) => (dir(x).dot(dir(y)).clamp(-1.0, 1.0).acos().to_degrees()).round(),
             _ => 0.0,
         };
+        let flip = match (kind, wa, wb) {
+            (CKind::Coincidence, GeomRef::Plane { n, .. }, GeomRef::Plane { n: tn, .. }) => n.dot(tn) < 0.0,
+            (CKind::Contact, GeomRef::Axis { p, .. }, GeomRef::Plane { p: tp, n: tn }) => (p - tp).dot(tn) < 0.0,
+            (CKind::Contact, GeomRef::Plane { p, n }, GeomRef::Axis { p: tp, .. }) => (tp - p).dot(n) < 0.0,
+            _ => false,
+        };
+        let rel = (kind == CKind::FixTogether).then(|| (cb.rot.inverse() * (ca.pos - cb.pos), (cb.rot.inverse() * ca.rot).normalize()));
         // if nothing is fixed yet, fix the second (target) component like an anchor
         if !pr.comps.iter().any(|c| c.fixed) {
             pr.comp_mut(b).unwrap().fixed = true;
         }
-        pr.constraints.push(Constraint { name: name.clone(), kind, a, ra, b, rb, value, flip: false });
+        pr.constraints.push(Constraint { name: name.clone(), kind, a, ra, b, rb, value, flip, rel });
         let idx = pr.constraints.len() - 1;
-        let probs = pr.solve();
+        let pending = pr.needs_update();
         self.tool = Tool::Constrain(kind, None);
         self.sel = Sel::Constraint(idx);
-        self.dialog = Dialog::Constraint(idx);
-        if probs.is_empty() {
-            self.say(&format!("{} created and applied. Pick two more faces for another, or Esc.", name));
+        if kind != CKind::FixTogether {
+            self.dialog = Dialog::Constraint(idx);
+        }
+        if pending {
+            self.say(&format!("{} created. Update (Ctrl+U) moves the parts into place. Pick two more faces for another, or Esc.", name));
         } else {
-            let m = probs.join("; ");
-            self.err(&m);
+            self.say(&format!("{} created (it already holds). Pick two more faces for another, or Esc.", name));
         }
     }
 
@@ -1796,10 +1818,11 @@ impl App {
         }
         self.tool = Tool::None;
         self.dialog = Dialog::None;
-        if let Some(pr) = self.product_mut() {
-            pr.solve();
+        if self.product().map_or(false, |p| p.needs_update()) {
+            self.say("Back in Assembly Design. The assembly needs an Update (Ctrl+U).");
+        } else {
+            self.say("Back in Assembly Design.");
         }
-        self.say("Back in Assembly Design.");
     }
 
     pub fn new_component_part(&mut self) {
@@ -2218,6 +2241,9 @@ impl App {
             }
             if inp.key(KeyCode::S) {
                 self.save(false);
+            }
+            if inp.key(KeyCode::U) && self.product().is_some() {
+                self.toolbar_command("as_update");
             }
             if inp.key(KeyCode::O) {
                 self.open_file_dialog(Purpose::OpenDoc);

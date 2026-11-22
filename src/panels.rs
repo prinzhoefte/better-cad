@@ -430,12 +430,13 @@ impl App {
             (
                 "Constraints",
                 vec![
-                    ("as_contact", "Contact Constraint", "Put two flat faces against each other"),
-                    ("as_offset", "Offset Constraint", "Keep two flat faces facing each other at a distance"),
-                    ("as_coinc", "Coincidence Constraint", "Line up two round faces (pin in hole) on one axis"),
-                    ("as_angle", "Angle Constraint", "Set the angle between two flat faces"),
+                    ("as_contact", "Contact Constraint", "Put two flat faces against each other,\nor a round face on a flat one (line contact)"),
+                    ("as_offset", "Offset Constraint", "Keep two flat faces at a distance"),
+                    ("as_coinc", "Coincidence Constraint", "Line up two round faces on one axis (pin in hole),\nput two flat faces in one plane, or an axis in a plane"),
+                    ("as_angle", "Angle Constraint", "Angle, parallelism or perpendicularity\nbetween two faces (choose in its dialog)"),
                     ("as_fix", "Fix Component", "Anchor a component so constraints never move it"),
-                    ("as_update", "Update All", "Re-apply all constraints"),
+                    ("as_fixtog", "Fix Together", "Two components move as one"),
+                    ("as_update", "Update All (Ctrl+U)", "Move the components so the constraints hold\n(lit while the assembly needs an update)"),
                 ],
             ),
             (
@@ -551,7 +552,9 @@ impl App {
             ("as_contact", Tool::Constrain(CKind::Contact, _)) => true,
             ("as_offset", Tool::Constrain(CKind::Offset, _)) => true,
             ("as_coinc", Tool::Constrain(CKind::Coincidence, _)) => true,
-            ("as_angle", Tool::Constrain(CKind::Angle, _)) => true,
+            ("as_angle", Tool::Constrain(CKind::Angle | CKind::Parallel | CKind::Perpendicular, _)) => true,
+            ("as_fixtog", Tool::Constrain(CKind::FixTogether, _)) => true,
+            ("as_update", _) => self.product().map_or(false, |p| p.needs_update()),
             _ => false,
         }
     }
@@ -688,8 +691,9 @@ impl App {
             }
             "as_contact" => self.start_tool(Tool::Constrain(CKind::Contact, None), "Contact: click a flat face of the component to move, then a face of another one."),
             "as_offset" => self.start_tool(Tool::Constrain(CKind::Offset, None), "Offset: click a flat face of the component to move, then a face of another one."),
-            "as_coinc" => self.start_tool(Tool::Constrain(CKind::Coincidence, None), "Coincidence: click a round face (pin), then a round face (hole) of another component."),
-            "as_angle" => self.start_tool(Tool::Constrain(CKind::Angle, None), "Angle: click a flat face of the component to turn, then a face of another one."),
+            "as_coinc" => self.start_tool(Tool::Constrain(CKind::Coincidence, None), "Coincidence: click a face of the component to move (round: its axis; flat: its plane), then one of another component."),
+            "as_angle" => self.start_tool(Tool::Constrain(CKind::Angle, None), "Angle: click a face of the component to turn, then a face of another one."),
+            "as_fixtog" => self.start_tool(Tool::Constrain(CKind::FixTogether, None), "Fix Together: click the first component, then the second; they move as one."),
             "as_fix" => {
                 if let Sel::Comp(id) = self.sel {
                     self.toggle_fix(id);
@@ -701,7 +705,7 @@ impl App {
                 if let Some(pr) = self.product_mut() {
                     let p = pr.solve();
                     if p.is_empty() {
-                        self.say("All constraints are satisfied.");
+                        self.say("Updated: all constraints are satisfied.");
                     } else {
                         let m = p.join("; ");
                         self.err(&m);
@@ -784,18 +788,25 @@ impl App {
                     }
                 }
                 rows.push(TreeRow { depth: 1, label: "Constraints".into(), icon: "constraints", sel: Sel::None, error: false, dim: false, bold: false, last: true });
+                // fixed components show as Fix constraints, like classic CAD
+                for c in pr.comps.iter().filter(|c| c.fixed) {
+                    rows.push(TreeRow { depth: 2, label: format!("Fix ({})", c.part.name), icon: "constraint", sel: Sel::Comp(c.id), error: false, dim: false, bold: false, last: pr.constraints.is_empty() });
+                }
                 for (i, c) in pr.constraints.iter().enumerate() {
                     let (an, bn) = (pr.comp(c.a).map(|x| x.part.name.clone()).unwrap_or_default(), pr.comp(c.b).map(|x| x.part.name.clone()).unwrap_or_default());
-                    let err = match (pr.comp(c.a), pr.comp(c.b)) {
+                    let off = match (pr.comp(c.a), pr.comp(c.b)) {
                         (Some(a), Some(b)) => constraint_error(c, a, b) > 1e-3 && !(a.fixed && b.fixed),
                         _ => true,
                     };
+                    // red: the last Update could not satisfy it; otherwise it waits for Update
+                    let broken = off && pr.broken.contains(&i);
                     let val = match c.kind {
                         CKind::Offset => format!(" = {} mm", fmt(c.value)),
                         CKind::Angle => format!(" = {} deg", fmt(c.value)),
                         _ => String::new(),
                     };
-                    rows.push(TreeRow { depth: 2, label: format!("{} ({}, {}){}", c.name, an, bn, val), icon: "constraint", sel: Sel::Constraint(i), error: err, dim: false, bold: false, last: i + 1 == pr.constraints.len() });
+                    let note = if broken { "" } else if off { "  (update needed)" } else { "" };
+                    rows.push(TreeRow { depth: 2, label: format!("{} ({}, {}){}{}", c.name, an, bn, val, note), icon: "constraint", sel: Sel::Constraint(i), error: broken, dim: false, bold: false, last: i + 1 == pr.constraints.len() });
                 }
             }
         }
@@ -2051,12 +2062,9 @@ impl App {
                     *n += 1;
                     c.name = format!("{} ({}.{})", c.part.name, c.part.name, n);
                 }
-                if changed_pose && !fixed {
-                    // explicit placement wins over constraints on this component for now
-                    Vec::new()
-                } else {
-                    pr.solve()
-                }
+                // like classic CAD, constraints wait for Update
+                let _ = (changed_pose, fixed);
+                Vec::<String>::new()
             };
             if !probs.is_empty() {
                 let m = probs.join("; ");
@@ -2218,7 +2226,7 @@ impl App {
                 return;
             }
         };
-        let r = self.dialog_rect(24.0 + 5.0 * 30.0 + 60.0);
+        let r = self.dialog_rect(24.0 + 6.0 * 30.0 + 60.0);
         self.ui.panel(r, Some(&format!("{} Constraint", c.kind.name())));
         let lx = r.x + 10.0;
         let fx = r.x + 140.0;
@@ -2236,8 +2244,20 @@ impl App {
         y += 30.0;
         let mut value = c.value;
         let mut flip = c.flip;
+        let mut kind = c.kind;
         let mut changed = false;
-        match c.kind {
+        // the Angle constraint's kinds, like classic CAD's dialog
+        if matches!(c.kind, CKind::Angle | CKind::Parallel | CKind::Perpendicular) {
+            let w = (fw + 130.0) / 3.0;
+            for (k, (kk, label)) in [(CKind::Perpendicular, "Perpendicular"), (CKind::Parallel, "Parallel"), (CKind::Angle, "Angle")].into_iter().enumerate() {
+                if self.ui.button_ex(&format!("con_kind{}", k), Rect::new(lx + k as f32 * w, y, w - 4.0, 26.0), label, kind == kk, true) && kind != kk {
+                    kind = kk;
+                    changed = true;
+                }
+            }
+            y += 32.0;
+        }
+        match kind {
             CKind::Offset => {
                 text("Offset (mm)", lx, y + 17.0, 16, C_TEXT);
                 changed |= self.ui.num_field("con_val", Rect::new(fx, y, fw, 24.0), &mut value, 1.0);
@@ -2250,7 +2270,7 @@ impl App {
             }
             _ => {}
         }
-        if c.kind != CKind::Angle {
+        if !matches!(kind, CKind::Angle | CKind::Perpendicular | CKind::FixTogether) {
             changed |= self.ui.checkbox("con_flip", fx, y + 2.0, "Flip orientation", &mut flip);
         }
         if self.ui.button("con_delete", Rect::new(lx, r.y + r.h - 36.0, 90.0, 28.0), "Delete") {
@@ -2267,10 +2287,13 @@ impl App {
             let pr = self.product_mut().unwrap();
             pr.constraints[i].value = value;
             pr.constraints[i].flip = flip;
-            let probs = pr.solve();
-            if !probs.is_empty() {
-                let m = probs.join("; ");
-                self.err(&m);
+            if pr.constraints[i].kind != kind {
+                pr.constraints[i].kind = kind;
+                let n = pr.next_name(kind.name());
+                pr.constraints[i].name = n;
+            }
+            if pr.needs_update() {
+                self.say("Changed. Update (Ctrl+U) moves the parts.");
             }
         }
     }
@@ -2828,6 +2851,13 @@ pub fn draw_icon(id: &str, cx: f32, cy: f32) {
             ln(cx, cy - 6.0, cx, cy + 10.0, 2.5, c);
             ln(cx - 9.0, cy + 3.0, cx, cy + 11.0, 2.5, c);
             ln(cx + 9.0, cy + 3.0, cx, cy + 11.0, 2.5, c);
+        }
+        "as_fixtog" => {
+            let c = Color::new(0.15, 0.25, 0.6, 1.0);
+            iso_box(cx - 13.0, cy - 2.0, 10.0, 9.0, 5.0, solid);
+            iso_box(cx + 1.0, cy - 2.0, 10.0, 9.0, 5.0, solid);
+            draw_circle_lines(cx, cy - 11.0, 3.5, 2.0, c);
+            ln(cx, cy - 8.0, cx, cy + 2.0, 2.5, c);
         }
         "as_update" => {
             draw_arc(cx, cy, 24, 10.0, 30.0, 3.0, 290.0, sk);
