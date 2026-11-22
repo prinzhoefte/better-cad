@@ -2,7 +2,7 @@
 
 **A free, open-source part and assembly modeller with a classic CAD workflow.**
 
-If you have used CATIA V5, BetterCAD will feel familiar: a specification tree on the left, workbench toolbars on the right, a constraint-driven Sketcher, and features like Pad, Pocket, Shaft and Edge Fillet that stay editable. It is written in Rust and builds to a single binary.
+If you have used CATIA V5, BetterCAD will feel familiar: a specification tree on the left, workbench toolbars on the right, CATIA-style mouse navigation and compass, a constraint-driven Sketcher with the same constraints and colours, and features like Pad, Pocket, Shaft and Edge Fillet that stay editable. It is written in Rust and builds to a single binary.
 
 ![Part Design: a bracket built from three sketches](docs/images/part-design.png)
 
@@ -11,9 +11,15 @@ If you have used CATIA V5, BetterCAD will feel familiar: a specification tree on
 ## Features
 
 ### Sketcher
-- **Drawing tools:** Profile, Line, Axis, Rectangle, Centered Rectangle, Hexagon/Polygon, Elongated Hole, Circle, Three Point Circle, Arc, Three Point Arc, Ellipse, Spline.
-- **Editing:** Corner (fillet), Chamfer, Quick Trim, Mirror, construction (helper) elements.
-- **Constraints that drive the geometry:** lengths, distances, radii, diameters and angles, plus automatic horizontal/vertical constraints. Double-click a dimension to change it. Fully constrained elements turn green.
+- **Drawing tools:** Profile, Line, Axis, Point, Rectangle, Centered Rectangle, Hexagon/Polygon, Elongated Hole, Circle, Three Point Circle, Arc, Three Point Arc, Ellipse, Spline. As in CATIA, a rectangle is four joined lines (two horizontal, two vertical), a hexagon is six lines on a construction circle, and an elongated hole is lines tangent to arcs.
+- **Editing:** Corner (fillet, tangent to both lines), Chamfer, Quick Trim, Mirror (with symmetry constraints), construction (helper) elements.
+- **Constraints that drive the geometry, solved all together:**
+  - Dimensional: length, distance (true, horizontal or vertical measure direction), radius, diameter, angle, semimajor/semiminor axis. Reference (driven) dimensions are shown in brackets.
+  - Geometric: coincidence (also point on curve, collinear), concentricity, tangency, parallelism, perpendicularity, horizontal, vertical, midpoint, equidistant point, symmetry, fix.
+  - Tools: **Constraint** (click one item, or two items, then click where the dimension goes; right-click for options), **Constraints Defined in Dialog Box** (pick one to three items, tick the constraints), **Contact Constraint** (concentric, tangent or coincident).
+  - **SmartPick** (the Geometrical Constraints button): drawing creates coincidence, horizontal/vertical, midpoint and concentricity constraints where you snap.
+  - CATIA colours: white is under-constrained, green fully constrained, purple over-constrained, red cannot be satisfied. A value that cannot be reached is refused and nothing changes.
+  - Dragging moves elements as far as their constraints allow. Double-click a dimension to change it.
 - **Smart snapping:** every point of what you draw or drag snaps, not just the cursor. Points snap onto end, middle and centre points, intersections and curves, and line up with other elements, with dashed alignment guides. Grid snapping toggles with **G**.
 - **References to earlier sketches:** earlier sketches show faintly while you sketch. You can snap to them, measure them, and constrain to them. A picked edge becomes a locked yellow reference that updates when its source sketch changes.
 - **Measure Between / Measure Item:** distances, angles, lengths, radii and areas.
@@ -33,7 +39,8 @@ Every feature stays editable: double-click it in the tree. Rebuilds run in the b
 ### Assembly Design
 - Build products from new parts, saved parts (`.bcpart`) or STL/OBJ meshes.
 - Move parts with the Manipulation gizmo (hold Ctrl to snap to 1 mm / 15°).
-- Contact, Offset, Coincidence and Angle constraints. Fix a component to anchor it.
+- Coincidence (axes, planes, an axis in a plane), Contact (faces, or a round face on a flat one), Offset, Angle / Parallelism / Perpendicularity, Fix and Fix Together constraints.
+- As in CATIA, constraints move the parts on **Update** (Ctrl+U); until then they show "update needed". On Update, constraints find their faces again when a part has changed.
 
 ### Look and files
 - Technical shading with edges, or **realistic rendering** (press **R**) with plastic, 3D-print, metal and wood finishes.
@@ -89,12 +96,16 @@ BetterCAD uses [macroquad](https://github.com/not-fl3/macroquad), which also run
 | Middle drag | Pan |
 | Hold middle + hold left (or right), drag | Rotate |
 | Hold middle, click left once, move up/down | Zoom |
-| Wheel | Zoom |
+| Wheel | Zoom towards the cursor (an addition; CATIA V5 has no wheel zoom) |
 | Middle click | Centre the view there |
 | Left click / right click | Select / context menu |
+| Compass: drag an axis / an arc / the base square / the top knob | Slide along that axis / turn about the axis square to the arc / slide in the xy plane / turn freely |
 
 | Key | Action |
 |---|---|
+| Arrows / Shift+arrows | Pan / rotate |
+| Ctrl+PgUp / Ctrl+PgDn | Zoom in / out |
+| Ctrl+U | Update the assembly |
 | Ctrl+Z / Ctrl+Y | Undo / redo |
 | Ctrl+N / Ctrl+O / Ctrl+S | New / open / save |
 | Del, Esc | Delete, cancel |
@@ -106,7 +117,7 @@ BetterCAD uses [macroquad](https://github.com/not-fl3/macroquad), which also run
 
 ### A first part in 30 seconds
 1. Click the **xy plane** in the tree, then **Sketch**.
-2. Pick **Rectangle**, click two corners, and type exact sizes on the right.
+2. Pick **Rectangle** and click two corners. For exact sizes, pick **Constraint**, click a side, click where the dimension goes, then double-click it and type the value.
 3. **Exit Workbench**, then **Pad**, then **OK**.
 4. Click the top face, **Sketch** again, draw a circle, exit, then **Pocket**.
 
@@ -127,7 +138,7 @@ The unit tests cover geometry, the sketch solver and features. The `--self-test`
 | `src/panels.rs` | Menu bar, toolbars, specification tree, dialogs, icons |
 | `src/sketch.rs` | Sketch elements and operations (trim, corner, mirror, regions) |
 | `src/sketcher.rs` | Sketcher workbench: tools, snapping, drawing |
-| `src/dims.rs` | Sketch dimensions and the constraint solver |
+| `src/dims.rs` | Sketch constraints, the simultaneous solver and the under/fully/over-constrained analysis |
 | `src/model.rs` | Parts, assemblies, features and rebuilds |
 | `src/geom.rs` | Solid geometry and meshing |
 | `src/dressup.rs` | Fillets, chamfers, draft, shell, thickness |

@@ -1435,7 +1435,10 @@ impl App {
         let data = self.sketch_data()?.clone();
         let sk = self.sketch.as_mut()?;
         if let Some((s, d, st)) = &sk.status {
-            if *s == data.shapes && *d == data.dims {
+            // while dragging, the constraints stay the same: keep the last status
+            // ponytail: dense elimination, O(equations x unknowns x rank); a sparse QR if big sketches lag
+            let dragging = matches!(sk.drag, Some(SkDrag::Shapes { .. } | SkDrag::Point { .. })) && *d == data.dims;
+            if dragging || (*s == data.shapes && *d == data.dims) {
                 return Some(st.clone());
             }
         }

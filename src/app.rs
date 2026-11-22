@@ -2172,14 +2172,25 @@ impl App {
 
     pub fn cancel(&mut self) {
         if let Some(sk) = self.sketch.as_mut() {
-            if !sk.pts.is_empty() {
-                sk.pts.clear();
+            if sk.menu.is_some() {
+                sk.menu = None;
                 return;
             }
-            if sk.cons_first.is_some() || sk.meas_first.is_some() || sk.sel_dim.is_some() {
+            if !sk.pts.is_empty() {
+                sk.pts.clear();
+                sk.profile.clear();
+                return;
+            }
+            if sk.cons_first.is_some() || sk.meas_first.is_some() || sk.sel_dim.is_some() || !sk.picks.is_empty() {
                 sk.cons_first = None;
+                sk.cons_second = None;
+                sk.cons_dir = crate::dims::MeasDir::Normal;
+                sk.cons_ref = false;
+                sk.cons_alt = false;
                 sk.meas_first = None;
                 sk.sel_dim = None;
+                sk.picks.clear();
+                sk.dlg_kinds.clear();
                 return;
             }
             if sk.tool != SkTool::Select {
