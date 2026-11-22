@@ -2339,7 +2339,7 @@ impl App {
             "  Pad extrudes the sketch, Pocket cuts it, Shaft / Groove revolve it",
             "  around the sketch's Axis (or its green V axis). Outlines inside outlines are holes.",
             "  Sketcher: Profile / Line draw connected lines; ends snap and get coincidence, H / V and",
-            "  other constraints (Geometrical Constraints button). G switches grid snapping.
+            "  other constraints (Geometrical Constraints button). G switches grid snapping.",
             "  Earlier sketches show faintly: snap, measure and constrain to them. A picked",
             "  edge becomes a locked yellow reference that follows its sketch when it changes.",
             "  Corner, Chamfer, Quick Trim and Mirror edit lines; Construction makes helpers.",
