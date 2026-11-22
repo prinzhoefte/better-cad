@@ -47,6 +47,7 @@ fn arg_value(name: &str) -> Option<String> {
 
 static mut ROT_BEFORE: Option<Quat> = None;
 static mut VOL_BEFORE: f64 = 0.0;
+static mut POS_BEFORE: Option<(Vec3, Quat)> = None;
 
 #[derive(Clone)]
 enum Act {
@@ -190,6 +191,37 @@ impl SelfTest {
                 let face_sketch = a.part().map_or(false, |p| p.features.iter().any(|f| matches!(&f.kind, FeatureKind::Sketch(s) if s.support == "face")));
                 ((v - expect).abs() < 25.0 && face_sketch, format!("sketched a D16 circle on the top face and pocketed it 10 mm: volume {} mm3 (expected about {})", fmt(v.round()), fmt(expect.round())))
             }),
+            // the compass, like classic CAD's: drag its x axis to slide the view along x, drag
+            // the arc in the xy plane to turn the view about z
+            Call(|a| {
+                a.view.anim = None;
+                unsafe { POS_BEFORE = Some((a.view.target, a.view.rot)) };
+            }),
+            Drag(|a| {
+                let (p, q) = (a.compass_proj(Vec3::X * 0.75), a.compass_proj(Vec3::X * 1.0));
+                Some((p, (q - p).normalize() * 40.0))
+            }, 10),
+            Check("compass axis", |a| {
+                let (t0, r0) = unsafe { POS_BEFORE }.unwrap();
+                let d = a.view.target - t0;
+                let ok = d.x.abs() > 1.0 && d.y.abs() < 1e-3 && d.z.abs() < 1e-3 && r0.angle_between(a.view.rot) < 1e-4;
+                (ok, format!("dragged the compass's x axis: the view slid {} mm along x only", fmt((d.x as f64 * 10.0).round() / 10.0)))
+            }),
+            Call(|a| unsafe { POS_BEFORE = Some((a.view.target, a.view.rot)) }),
+            Drag(|a| {
+                let p = a.compass_proj((Vec3::X + Vec3::Y).normalize() * 0.8);
+                let q = a.compass_proj((Vec3::X * 0.5 + Vec3::Y).normalize() * 0.8);
+                Some((p, (q - p).normalize() * 30.0))
+            }, 10),
+            Check("compass arc", |a| {
+                let (_, r0) = unsafe { POS_BEFORE }.unwrap();
+                let (b0, b1) = (r0 * Vec3::Z, a.view.back());
+                let turned = r0.angle_between(a.view.rot).to_degrees();
+                let ok = turned > 5.0 && (b0.z - b1.z).abs() < 1e-4;
+                (ok, format!("dragged the compass's xy arc: the view turned {} deg about z (z stays where it was on screen)", fmt(turned.round() as f64)))
+            }),
+            Call(|a| a.fit_all()),
+            Wait(40),
             // constrain to the first sketch from a new sketch on the top face: clicking its
             // (projected) right edge with Constraint adopts it as a locked reference element
             Call(|a| a.fit_all()),

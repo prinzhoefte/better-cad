@@ -31,8 +31,22 @@ pub enum Nav {
     Pan,
     Rotate,
     Zoom,
-    Compass,
+    /// dragging a part of the compass
+    Compass(Grip),
 }
+
+/// The parts of the orientation compass, like classic CAD's: an axis line moves the view
+/// along that axis, an arc turns it about the axis square to the arc, the base square moves
+/// it in the xy plane, the knob on top turns it freely.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Grip {
+    Free,
+    Axis(usize),
+    Arc(usize),
+    Plane,
+}
+
+const AXES: [Vec3; 3] = [Vec3::X, Vec3::Y, Vec3::Z];
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Tool {
@@ -373,6 +387,7 @@ impl App {
         let over = self.ui.over_ui();
         if !modal {
             self.viewport_input(over);
+            self.keyboard_nav(dt);
         } else {
             self.hover = None;
         }
@@ -703,34 +718,46 @@ impl App {
             let c = inv * v;
             o + vec2(c.x, -c.y) * 38.0
         };
-        let hot = self.ui.hover(r) || self.nav == Nav::Compass;
-        let base = if hot { Color::new(1.0, 0.75, 0.35, 1.0) } else { Color::new(0.75, 0.78, 0.85, 0.9) };
+        let grip = match self.nav {
+            Nav::Compass(g) => Some(g),
+            _ if self.nav == Nav::None => self.compass_hit(self.ui.inp.mouse),
+            _ => None,
+        };
+        let base = Color::new(0.75, 0.78, 0.85, 0.9);
+        let hot = Color::new(1.0, 0.75, 0.35, 1.0);
+        let col = |g: Grip| if grip == Some(g) || grip == Some(Grip::Free) && g == Grip::Free { hot } else { base };
         // the xy square
         let sq = [vec3(0.0, 0.0, 0.0), vec3(0.45, 0.0, 0.0), vec3(0.45, 0.45, 0.0), vec3(0.0, 0.45, 0.0)];
         let sp: Vec<Vec2> = sq.iter().map(|v| proj(*v)).collect();
-        draw_triangle(sp[0], sp[1], sp[2], Color::new(base.r, base.g, base.b, 0.18));
-        draw_triangle(sp[0], sp[2], sp[3], Color::new(base.r, base.g, base.b, 0.18));
+        let c = col(Grip::Plane);
+        draw_triangle(sp[0], sp[1], sp[2], Color::new(c.r, c.g, c.b, 0.18));
+        draw_triangle(sp[0], sp[2], sp[3], Color::new(c.r, c.g, c.b, 0.18));
         for k in 0..4 {
-            draw_line(sp[k].x, sp[k].y, sp[(k + 1) % 4].x, sp[(k + 1) % 4].y, 1.0, base);
+            draw_line(sp[k].x, sp[k].y, sp[(k + 1) % 4].x, sp[(k + 1) % 4].y, 1.0, c);
         }
-        // quarter arcs in each coordinate plane
-        for (a, b) in [(Vec3::X, Vec3::Y), (Vec3::Y, Vec3::Z), (Vec3::Z, Vec3::X)] {
+        // quarter arcs in each coordinate plane (turn about the third axis)
+        for (k, (a, b)) in [(Vec3::Y, Vec3::Z), (Vec3::Z, Vec3::X), (Vec3::X, Vec3::Y)].into_iter().enumerate() {
+            let c = col(Grip::Arc(k));
             let mut prev = proj(a * 0.8);
             for i in 1..=12 {
                 let t = i as f32 / 12.0 * std::f32::consts::FRAC_PI_2;
                 let p = proj((a * t.cos() + b * t.sin()) * 0.8);
-                draw_line(prev.x, prev.y, p.x, p.y, 1.0, Color::new(base.r, base.g, base.b, 0.6));
+                draw_line(prev.x, prev.y, p.x, p.y, if c == hot { 2.0 } else { 1.0 }, Color::new(c.r, c.g, c.b, if c == hot { 1.0 } else { 0.6 }));
                 prev = p;
             }
         }
-        for (v, n) in [(Vec3::X, "x"), (Vec3::Y, "y"), (Vec3::Z, "z")] {
+        for (k, (v, n)) in [(Vec3::X, "x"), (Vec3::Y, "y"), (Vec3::Z, "z")].into_iter().enumerate() {
+            let c = col(Grip::Axis(k));
             let e = proj(v);
-            draw_line(o.x, o.y, e.x, e.y, 2.0, base);
+            draw_line(o.x, o.y, e.x, e.y, 2.0, c);
             let d = (e - o).normalize_or_zero();
             let p = vec2(-d.y, d.x);
-            draw_triangle(e + d * 7.0, e + p * 3.5, e - p * 3.5, base);
-            text(n, e.x + d.x * 12.0 - 3.0, e.y + d.y * 12.0 + 5.0, 15, base);
+            draw_triangle(e + d * 7.0, e + p * 3.5, e - p * 3.5, c);
+            text(n, e.x + d.x * 12.0 - 3.0, e.y + d.y * 12.0 + 5.0, 15, c);
         }
+        // the free rotation knob on top of z
+        let kn = proj(Vec3::Z * 1.6);
+        draw_circle(kn.x, kn.y, 3.5, col(Grip::Free));
         draw_circle(o.x, o.y, 2.5, base);
     }
 
@@ -888,6 +915,89 @@ impl App {
         let h = self.pick(mouse).map(|h| h.point);
         self.active_comp = saved;
         h
+    }
+
+    /// Where a point of the compass (in its own axes) is on screen.
+    pub fn compass_proj(&self, v: Vec3) -> Vec2 {
+        let r = self.compass_rect();
+        let o = vec2(r.x + r.w * 0.45, r.y + r.h * 0.62);
+        let c = self.view.rot.inverse() * v;
+        o + vec2(c.x, -c.y) * 38.0
+    }
+
+    /// Which part of the compass is under `m` (Free anywhere else on it).
+    pub fn compass_hit(&self, m: Vec2) -> Option<Grip> {
+        if !self.compass_rect().contains(m) {
+            return None;
+        }
+        let proj = |v: Vec3| self.compass_proj(v);
+        let seg = |p: Vec2, a: Vec2, b: Vec2| -> f32 {
+            let ab = b - a;
+            let t = if ab.length_squared() < 1e-6 { 0.0 } else { ((p - a).dot(ab) / ab.length_squared()).clamp(0.0, 1.0) };
+            (a + ab * t - p).length()
+        };
+        if (proj(Vec3::Z * 1.6) - m).length() < 7.0 {
+            return Some(Grip::Free);
+        }
+        let mut best: Option<(f32, Grip)> = None;
+        let mut consider = |d: f32, g: Grip| {
+            if d < 5.0 && best.map_or(true, |b| d < b.0) {
+                best = Some((d, g));
+            }
+        };
+        for k in 0..3 {
+            // the outer part of each axis (the middle belongs to the square)
+            consider(seg(m, proj(AXES[k] * 0.5), proj(AXES[k] * 1.1)), Grip::Axis(k));
+            let (a, b) = (AXES[(k + 1) % 3], AXES[(k + 2) % 3]);
+            for i in 0..12 {
+                let t0 = i as f32 / 12.0 * std::f32::consts::FRAC_PI_2;
+                let t1 = (i + 1) as f32 / 12.0 * std::f32::consts::FRAC_PI_2;
+                consider(seg(m, proj((a * t0.cos() + b * t0.sin()) * 0.8), proj((a * t1.cos() + b * t1.sin()) * 0.8)), Grip::Arc(k));
+            }
+        }
+        if let Some((_, g)) = best {
+            return Some(g);
+        }
+        let q = [proj(Vec3::ZERO), proj(vec3(0.45, 0.0, 0.0)), proj(vec3(0.45, 0.45, 0.0)), proj(vec3(0.0, 0.45, 0.0))];
+        let inside = (0..4).all(|k| (q[(k + 1) % 4] - q[k]).perp_dot(m - q[k]) >= 0.0) || (0..4).all(|k| (q[(k + 1) % 4] - q[k]).perp_dot(m - q[k]) <= 0.0);
+        Some(if inside { Grip::Plane } else { Grip::Free })
+    }
+
+    /// Moves or turns the view by dragging a part of the compass by `delta` (mouse at `m`).
+    fn drag_compass(&mut self, g: Grip, m: Vec2, delta: Vec2) {
+        let r = self.compass_rect();
+        let v = &mut self.view;
+        let k = v.px_size(v.target);
+        match g {
+            Grip::Free => v.orbit(delta.x, delta.y),
+            Grip::Axis(i) => {
+                // the model slides along the axis, following the mouse
+                let a = AXES[i];
+                let s = vec2(a.dot(v.right()), -a.dot(v.up())) / k;
+                if s.length_squared() > 1e-6 {
+                    v.target -= a * (delta.dot(s) / s.length_squared());
+                }
+            }
+            Grip::Plane => {
+                let w = (v.right() * delta.x - v.up() * delta.y) * k;
+                v.target -= w - Vec3::Z * w.dot(Vec3::Z);
+            }
+            Grip::Arc(i) => {
+                // turn about the axis square to the arc, by the mouse's turn around the compass
+                let o = vec2(r.x + r.w * 0.45, r.y + r.h * 0.62);
+                let ang = |p: Vec2| (-(p.y - o.y)).atan2(p.x - o.x);
+                let mut d = ang(m) - ang(m - delta);
+                if d > std::f32::consts::PI {
+                    d -= std::f32::consts::TAU;
+                } else if d < -std::f32::consts::PI {
+                    d += std::f32::consts::TAU;
+                }
+                let n = AXES[i];
+                let phi = d * if n.dot(v.back()) >= 0.0 { 1.0 } else { -1.0 };
+                v.rot = (Quat::from_axis_angle(n, -phi) * v.rot).normalize();
+            }
+        }
+        v.anim = None;
     }
 
     pub fn compass_rect(&self) -> Rect {
@@ -1234,13 +1344,17 @@ impl App {
             self.nav = Nav::Pan;
             self.nav_moved = 0.0;
         }
-        if inp.pressed[LMB] && self.nav == Nav::None && self.compass_rect().contains(inp.mouse) {
-            self.nav = Nav::Compass;
+        if inp.pressed[LMB] && self.nav == Nav::None {
+            if let Some(g) = self.compass_hit(inp.mouse) {
+                self.nav = Nav::Compass(g);
+            }
         }
         match self.nav {
-            Nav::Compass => {
+            Nav::Compass(g) => {
                 if inp.down[LMB] {
-                    self.view.orbit(delta.x, delta.y);
+                    if delta.length() > 0.0 {
+                        self.drag_compass(g, inp.mouse, delta);
+                    }
                 } else {
                     self.nav = Nav::None;
                 }
@@ -2063,6 +2177,31 @@ impl App {
         }
         self.measure_result = None;
         self.sel = Sel::None;
+    }
+
+    /// Classic CAD keyboard navigation: arrows pan, Shift + arrows rotate, Ctrl + Page Up /
+    /// Page Down zoom in / out. Keys held down keep moving the view.
+    fn keyboard_nav(&mut self, dt: f32) {
+        if self.ui.typing() || self.ui.focus.is_some() {
+            return;
+        }
+        let k = |c: KeyCode| is_key_down(c);
+        let (shift, ctrl) = (self.ui.inp.shift, self.ui.inp.ctrl);
+        let dir = vec2((k(KeyCode::Right) as i32 - k(KeyCode::Left) as i32) as f32, (k(KeyCode::Down) as i32 - k(KeyCode::Up) as i32) as f32);
+        if dir != Vec2::ZERO && !ctrl {
+            if shift {
+                self.view.orbit(dir.x * 260.0 * dt, dir.y * 260.0 * dt);
+            } else {
+                // the model moves the way the arrow points
+                self.view.pan(dir.x * 400.0 * dt, dir.y * 400.0 * dt);
+            }
+        }
+        if ctrl {
+            let z = k(KeyCode::PageDown) as i32 - k(KeyCode::PageUp) as i32;
+            if z != 0 {
+                self.view.zoom_center(z as f32 * 300.0 * dt);
+            }
+        }
     }
 
     fn shortcuts(&mut self) {
